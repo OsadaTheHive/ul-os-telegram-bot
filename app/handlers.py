@@ -174,17 +174,10 @@ async def handle_mcp_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_mcp_szukaj(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Search w Vault przez MCP server (placeholder - wymaga peelnego MCP handshake).
+    """Search w Vault przez MCP server vault_search tool (real client od 2026-05-09)."""
+    from .services import mcp_client
+    from . import breaker as bk
 
-    Aktualnie MCP server Huberta wystawia 4 tools przez JSON-RPC streamable HTTP.
-    Pelen MCP client wymaga:
-      1. Session initialize (negotiate protocol version)
-      2. tools/list
-      3. tools/call z nazwa i argumentami
-
-    Single-session bug Huberta: server nie obsluguje multiple parallel transports.
-    Ten handler placeholder - po naprawie po stronie servera mozna pełnić MCP client.
-    """
     query = " ".join(context.args) if context.args else ""
     if not query:
         await update.message.reply_text(
@@ -193,28 +186,171 @@ async def handle_mcp_szukaj(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    msg = (
-        f'MCP search: "{query}"\n\n'
-        "(WIP - pelny MCP client w bocie czeka na:\n"
-        "  - dokumentacje 4 tools wystawionych przez Huberta\n"
-        "  - per-session transport pool (obecnie single-session)\n\n"
-        "Tymczasowo uzywaj /produkt <nazwa> lub /ostatnie do queries Directusa.)"
-    )
-    await update.message.reply_text(msg)
+    client = mcp_client.get_client()
+    if not client:
+        await update.message.reply_text("MCP nie skonfigurowany (brak MCP_BEARER_TOKEN).")
+        return
+
+    try:
+        # Wrap w circuit breaker - jezeli MCP pad N razy, automatic fail-fast
+        result = await bk.get("mcp").call_async(
+            client.call_tool, "vault_search", {"query": query, "limit": 10}
+        )
+        text = mcp_client.extract_text_content(result)
+        if not text:
+            await update.message.reply_text(f'Brak wynikow dla: "{query}"')
+            return
+
+        # Telegram message limit 4096 chars
+        msg = f'🔍 vault_search: "{query}"\n\n{text}'
+        if len(msg) > 3800:
+            msg = msg[:3800] + "\n\n... (truncated, użyj /mcp_szukaj precyzyjniej)"
+        await update.message.reply_text(msg)
+    except mcp_client.MCPError as e:
+        await update.message.reply_text(f"MCP error: {e}")
+    except bk.CircuitBreakerError as e:
+        await update.message.reply_text(f"⚡ MCP circuit breaker OPEN: {e}\nPoczekaj minutę.")
+    except Exception as e:
+        log.exception("mcp_szukaj failed")
+        await update.message.reply_text(f"Blad: {e.__class__.__name__}: {e}")
+
+
+async def handle_mcp_tools(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lista tools wystawianych przez MCP server."""
+    from .services import mcp_client
+    from . import breaker as bk
+
+    client = mcp_client.get_client()
+    if not client:
+        await update.message.reply_text("MCP nie skonfigurowany.")
+        return
+
+    try:
+        tools = await bk.get("mcp").call_async(client.list_tools)
+        if not tools:
+            await update.message.reply_text("Brak tools w MCP server.")
+            return
+
+        msg = f"🧰 MCP tools ({len(tools)}):\n\n"
+        for t in tools:
+            name = t.get("name", "?")
+            desc = t.get("description", "")
+            msg += f"• {name}\n"
+            if desc:
+                # First line of description
+                first_line = desc.split("\n")[0][:120]
+                msg += f"  {first_line}\n"
+            msg += "\n"
+        await update.message.reply_text(msg)
+    except mcp_client.MCPError as e:
+        await update.message.reply_text(f"MCP error: {e}")
+    except bk.CircuitBreakerError as e:
+        await update.message.reply_text(f"⚡ MCP circuit breaker: {e}")
 
 
 async def handle_szukaj(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Simple full-text search w knowledge_items po title + content_text + summary."""
+    from . import breaker as bk
+
     query = " ".join(context.args) if context.args else ""
     if not query:
         await update.message.reply_text(
             "Uzycie: /szukaj <query>\n"
-            "Przyklad: /szukaj magazyn energii LFP 5kWh"
+            "Przyklad: /szukaj magazyn energii LFP 5kWh\n\n"
+            "Tip: dla semantic search uzyj /mcp_szukaj <query>"
         )
         return
-    await update.message.reply_text(
-        f'Szukam: "{query}"\n\n'
-        "(WIP - semantic search bedzie dostepny po wlaczeniu pgvector w Q3 2026)"
-    )
+
+    if not settings.directus_token:
+        await update.message.reply_text("Directus token brak.")
+        return
+
+    try:
+        async def directus_search():
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.get(
+                    f"{settings.directus_url}/items/knowledge_items",
+                    params={
+                        "filter[_or][0][title][_icontains]": query,
+                        "filter[_or][1][content_text][_icontains]": query,
+                        "filter[_or][2][summary][_icontains]": query,
+                        "limit": 10,
+                        "sort": "-date_created",
+                        "fields": "id,title,brand,type,date_created,kontrahent",
+                    },
+                    headers={"Authorization": f"Bearer {settings.directus_token}"},
+                )
+                r.raise_for_status()
+                return r.json()
+
+        # Circuit breaker dla Directus
+        data = await bk.get("directus").call_async(directus_search)
+        items = data.get("data", [])
+
+        if not items:
+            await update.message.reply_text(f'Brak wynikow dla: "{query}"')
+            return
+
+        msg = f'🔍 Wyniki ({len(items)}) dla: "{query}"\n\n'
+        for item in items:
+            title = item.get("title", "?")
+            brand = item.get("brand", "?")
+            doc_type = item.get("type", "?")
+            date = (item.get("date_created") or "?")[:10]
+            kontrahent = item.get("kontrahent")
+
+            msg += f"• [{brand}/{doc_type}] {title}\n"
+            msg += f"  {date}"
+            if kontrahent:
+                msg += f" · {kontrahent}"
+            msg += "\n\n"
+
+        if len(msg) > 3800:
+            msg = msg[:3800] + "\n... (truncated)"
+        await update.message.reply_text(msg)
+
+    except bk.CircuitBreakerError as e:
+        await update.message.reply_text(f"⚡ Directus circuit breaker: {e}")
+    except Exception as e:
+        log.exception("szukaj failed")
+        await update.message.reply_text(f"Blad: {e.__class__.__name__}: {e}")
+
+
+async def handle_breakers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Diagnostyka - state circuit breakers."""
+    from . import breaker as bk
+
+    stats = bk.all_stats()
+    msg = "⚡ Circuit breakers:\n\n"
+    state_emoji = {"closed": "🟢", "half_open": "🟡", "open": "🔴"}
+
+    for name, s in stats.items():
+        emoji = state_emoji.get(s["state"], "?")
+        msg += f"{emoji} {name}: {s['state']}\n"
+        msg += f"   failures: {s['failures']}/{s['threshold']}\n"
+        if s.get("seconds_until_half_open"):
+            msg += f"   recovery in: {s['seconds_until_half_open']:.0f}s\n"
+        msg += "\n"
+
+    await update.message.reply_text(msg)
+
+
+async def handle_limits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Diagnostyka - rate limit status per user."""
+    from .limiter import limiter, LIMITS
+
+    user = update.effective_user
+    if not user:
+        await update.message.reply_text("Brak user context.")
+        return
+
+    msg = f"⏱ Rate limits dla @{user.username or user.first_name}:\n\n"
+    for key, (limit, window) in LIMITS.items():
+        remaining = limiter.remaining(user.id, key, limit=limit, window=window)
+        msg += f"  /{key}: {remaining}/{limit} pozostalo (w {int(window)}s)\n"
+
+    msg += f"\nTotal buckets: {limiter.stats()['total_buckets']}"
+    await update.message.reply_text(msg)
 
 
 async def handle_produkt(update: Update, context: ContextTypes.DEFAULT_TYPE):

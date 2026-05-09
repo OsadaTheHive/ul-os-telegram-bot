@@ -17,6 +17,7 @@ Stack:
 from __future__ import annotations
 
 import logging
+import os
 import sys
 
 from telegram import BotCommand, Update
@@ -35,14 +36,17 @@ from .config import settings
 from .limiter import check as rate_check
 from .handlers import (
     handle_audit,
+    handle_breakers,
     handle_digest,
     handle_dlq,
     handle_document,
     handle_help,
     handle_health,
     handle_koszty,
+    handle_limits,
     handle_mcp_status,
     handle_mcp_szukaj,
+    handle_mcp_tools,
     handle_ostatnie,
     handle_photo,
     handle_produkt,
@@ -53,11 +57,14 @@ from .handlers import (
     handle_voice,
 )
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-    stream=sys.stdout,
-)
+from . import observability
+
+# Setup logging (text format dla dev / JSON dla produkcji - LOG_FORMAT=json env)
+observability.setup_logging(level=logging.INFO)
+
+# Setup Sentry (NoOp jezeli SENTRY_DSN nieustawiony)
+observability.setup_sentry(environment=os.getenv("SENTRY_ENVIRONMENT", "development"))
+
 log = logging.getLogger(__name__)
 
 
@@ -220,6 +227,24 @@ async def cmd_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_audit(update, context)
 
 
+async def cmd_breakers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorized_or_ignore(update, context):
+        return
+    await handle_breakers(update, context)
+
+
+async def cmd_limits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorized_or_ignore(update, context):
+        return
+    await handle_limits(update, context)
+
+
+async def cmd_mcp_tools(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorized_or_ignore(update, context):
+        return
+    await handle_mcp_tools(update, context)
+
+
 async def msg_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorized_or_ignore(update, context):
         return
@@ -255,6 +280,9 @@ async def post_init(app: Application):
             BotCommand("dlq", "Dead Letter Queue (failed ingests)"),
             BotCommand("digest", "Daily summary (manualne wyzwolenie)"),
             BotCommand("audit", "Ostatnie 20 akcji z audit log"),
+            BotCommand("breakers", "Status circuit breakers (Directus/MCP/Anthropic)"),
+            BotCommand("limits", "Twoje rate limits per komenda"),
+            BotCommand("mcp_tools", "Lista 5 tools wystawionych przez MCP"),
         ]
     )
     log.info(
@@ -315,6 +343,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("dlq", cmd_dlq))
     app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("audit", cmd_audit))
+    app.add_handler(CommandHandler("breakers", cmd_breakers))
+    app.add_handler(CommandHandler("limits", cmd_limits))
+    app.add_handler(CommandHandler("mcp_tools", cmd_mcp_tools))
 
     app.add_handler(MessageHandler(filters.Document.ALL, msg_document))
     app.add_handler(MessageHandler(filters.PHOTO, msg_photo))
