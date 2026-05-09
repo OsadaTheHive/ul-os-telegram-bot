@@ -68,7 +68,7 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sprawdz Worker + Directus + B2 (jak juz beda)."""
+    """Sprawdz Worker + Directus + MCP + B2 (jak juz beda)."""
     msg = "Status UL OS:\n"
 
     # Directus check
@@ -81,6 +81,28 @@ async def handle_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg += f" * Directus: {r.status_code}\n"
     except Exception as e:
         msg += f" * Directus: ERROR ({e.__class__.__name__})\n"
+
+    # MCP server check (NEW - 2026-05-09)
+    if settings.mcp_base_url and settings.mcp_bearer_token:
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                r = await client.get(
+                    f"{settings.mcp_base_url}/health",
+                    headers={"Authorization": f"Bearer {settings.mcp_bearer_token}"},
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    tools = data.get("tools_count", "?")
+                    last_pull = data.get("vault_last_pulled", "?")
+                    if isinstance(last_pull, str) and len(last_pull) >= 19:
+                        last_pull = last_pull[:19].replace("T", " ")
+                    msg += f" * MCP server: OK ({tools} tools, vault pull {last_pull})\n"
+                else:
+                    msg += f" * MCP server: {r.status_code}\n"
+        except Exception as e:
+            msg += f" * MCP server: ERROR ({e.__class__.__name__})\n"
+    else:
+        msg += " * MCP server: brak konfiguracji\n"
 
     # Worker check (jezeli adres skonfigurowany)
     if settings.worker_url and "localhost" not in settings.worker_url:
@@ -102,6 +124,75 @@ async def handle_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         msg += " * Backblaze B2: brak kluczy (Tier 0 milestone)\n"
 
+    await update.message.reply_text(msg)
+
+
+async def handle_mcp_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Szczegolowy status MCP server - vault info, tools, repo."""
+    if not settings.mcp_bearer_token:
+        await update.message.reply_text(
+            "MCP nie skonfigurowany. Brak MCP_BEARER_TOKEN w env."
+        )
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"{settings.mcp_base_url}/health",
+                headers={"Authorization": f"Bearer {settings.mcp_bearer_token}"},
+            )
+            if r.status_code != 200:
+                await update.message.reply_text(
+                    f"MCP server zwrocil {r.status_code}: {r.text[:200]}"
+                )
+                return
+
+            data = r.json()
+            msg = f"UL OS MCP Server ({settings.mcp_base_url})\n\n"
+            msg += f"Status: {data.get('status', '?')}\n"
+            msg += f"Tools wystawione: {data.get('tools_count', '?')}\n"
+            last_pull = data.get("vault_last_pulled", "")
+            if last_pull:
+                msg += f"Vault last pull: {last_pull[:19].replace('T', ' ')} UTC\n"
+            msg += "\n"
+            msg += "Vault repo: OsadaTheHive/HiveLive_Vault\n"
+            msg += "Tenant: hivelive_ecosystem\n"
+            msg += "\n"
+            msg += "Aby uzyc tools (semantic search, vault query):\n"
+            msg += "  /mcp_szukaj <query>"
+            await update.message.reply_text(msg)
+    except Exception as e:
+        log.exception("mcp_status failed")
+        await update.message.reply_text(f"MCP error: {e.__class__.__name__}: {e}")
+
+
+async def handle_mcp_szukaj(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Search w Vault przez MCP server (placeholder - wymaga peelnego MCP handshake).
+
+    Aktualnie MCP server Huberta wystawia 4 tools przez JSON-RPC streamable HTTP.
+    Pelen MCP client wymaga:
+      1. Session initialize (negotiate protocol version)
+      2. tools/list
+      3. tools/call z nazwa i argumentami
+
+    Single-session bug Huberta: server nie obsluguje multiple parallel transports.
+    Ten handler placeholder - po naprawie po stronie servera mozna pełnić MCP client.
+    """
+    query = " ".join(context.args) if context.args else ""
+    if not query:
+        await update.message.reply_text(
+            "Uzycie: /mcp_szukaj <query>\n"
+            "Przyklad: /mcp_szukaj BEEzzy strategia sprzedazy"
+        )
+        return
+
+    msg = (
+        f'MCP search: "{query}"\n\n'
+        "(WIP - pelny MCP client w bocie czeka na:\n"
+        "  - dokumentacje 4 tools wystawionych przez Huberta\n"
+        "  - per-session transport pool (obecnie single-session)\n\n"
+        "Tymczasowo uzywaj /produkt <nazwa> lub /ostatnie do queries Directusa.)"
+    )
     await update.message.reply_text(msg)
 
 

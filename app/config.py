@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     worker_url: str = Field(default="http://ul-os-worker:3000")
     worker_secret: str = Field(default="")
 
+    # MCP server (UL OS Knowledge bridge)
+    mcp_base_url: str = Field(default="https://mcp.bidbee.pl")
+    mcp_bearer_token: str = Field(default="")
+
     # Storage
     b2_endpoint: str = Field(default="")
     b2_bucket_archive: str = Field(default="ul-os-archive")

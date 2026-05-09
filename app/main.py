@@ -33,6 +33,8 @@ from .handlers import (
     handle_document,
     handle_help,
     handle_health,
+    handle_mcp_status,
+    handle_mcp_szukaj,
     handle_ostatnie,
     handle_photo,
     handle_produkt,
@@ -108,6 +110,18 @@ async def cmd_ulos_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_ulos_status(update, context)
 
 
+async def cmd_mcp_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorized_or_ignore(update, context):
+        return
+    await handle_mcp_status(update, context)
+
+
+async def cmd_mcp_szukaj(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorized_or_ignore(update, context):
+        return
+    await handle_mcp_szukaj(update, context)
+
+
 async def msg_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorized_or_ignore(update, context):
         return
@@ -137,6 +151,8 @@ async def post_init(app: Application):
             BotCommand("produkt", "Info o produkcie BEEzzy"),
             BotCommand("ostatnie", "Ostatnio dodane dokumenty"),
             BotCommand("ulos_status", "Statystyki UL OS"),
+            BotCommand("mcp_status", "Status MCP server (mcp.bidbee.pl)"),
+            BotCommand("mcp_szukaj", "Search w Vault przez MCP (WIP)"),
         ]
     )
     log.info(
@@ -162,6 +178,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("produkt", cmd_produkt))
     app.add_handler(CommandHandler("ostatnie", cmd_ostatnie))
     app.add_handler(CommandHandler("ulos_status", cmd_ulos_status))
+    app.add_handler(CommandHandler("mcp_status", cmd_mcp_status))
+    app.add_handler(CommandHandler("mcp_szukaj", cmd_mcp_szukaj))
 
     app.add_handler(MessageHandler(filters.Document.ALL, msg_document))
     app.add_handler(MessageHandler(filters.PHOTO, msg_photo))
