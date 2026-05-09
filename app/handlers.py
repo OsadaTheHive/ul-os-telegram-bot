@@ -348,3 +348,172 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Otrzymalem voice memo ({voice.duration}s).\n\n"
         "(WIP - Whisper transkrypcja w Q3 2026 wg roadmapy)"
     )
+
+
+# ============================================================
+# /koszty - estymata kosztow API z lokalnego audit + Directus
+# ============================================================
+
+async def handle_koszty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Estymata kosztow API + statystyki uzycia."""
+    from .services import usage_stats
+
+    # Window: 24h default, mozna /koszty 7 → 7 dni
+    window_hours = 24
+    if context.args:
+        try:
+            days = int(context.args[0])
+            window_hours = max(1, min(days * 24, 24 * 30))  # cap 30 dni
+        except ValueError:
+            pass
+
+    local = usage_stats.stats_local(window_hours=window_hours)
+    directus = await usage_stats.stats_directus(window_hours=window_hours)
+
+    msg = f"Koszty UL OS (ostatnie {window_hours}h)\n\n"
+
+    # Bot stats (lokalnie z audit.jsonl)
+    msg += "📊 Bot Telegram\n"
+    msg += f"  • Total events: {local['total_events']}\n"
+    if local["file_ingests"] > 0:
+        msg += f"  • File ingests: {local['file_ingests']} (estymata $${local['est_cost_usd']:.4f})\n"
+    if local["rate_limited"] > 0:
+        msg += f"  • ⚠ Rate-limited: {local['rate_limited']}\n"
+    msg += f"  • Audit log: {local['audit_file_size_bytes'] / 1024:.1f} KB\n\n"
+
+    # Directus stats (real classifier work)
+    if "error" not in directus:
+        msg += "🗂 Directus knowledge_items\n"
+        msg += f"  • Total: {directus['total']}\n"
+        msg += f"  • Recent ({window_hours}h): {directus['recent_count']}\n"
+        for brand, cnt in sorted(directus["by_brand"].items(), key=lambda x: -x[1]):
+            msg += f"    - {brand}: {cnt}\n"
+    else:
+        msg += f"⚠ Directus stats: {directus['error']}\n"
+
+    msg += "\n💰 Anthropic API (real cost):\n"
+    msg += "  Wymaga ANTHROPIC_ADMIN_KEY + org_id (Hubert).\n"
+    msg += "  Tymczasowo estymata z bot ingest count powyzej.\n\n"
+
+    msg += f"Pricing: Haiku 4.5 = $1/$5 per 1M tokens (in/out)\n"
+    msg += f"Estymata per doc: $${usage_stats.EST_COST_PER_CLASSIFICATION:.4f}"
+
+    await update.message.reply_text(msg)
+
+
+# ============================================================
+# /dlq - lista failed ingests (Dead Letter Queue)
+# ============================================================
+
+async def handle_dlq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lista failed items czekajacych na review/retry."""
+    from .services import dlq
+
+    result = await dlq.list_dlq_items(limit=10)
+
+    msg = "Dead Letter Queue (failed ingests)\n\n"
+    msg += f"Status: {result['status']}\n\n"
+    msg += result.get("message", "")
+
+    if result["total"] > 0:
+        msg += f"\n\nItems ({result['total']}):\n"
+        for item in result["items"][:10]:
+            msg += f"  • {item.get('hash', '?')[:12]}... - {item.get('error', '?')}\n"
+
+    await update.message.reply_text(msg)
+
+
+# ============================================================
+# /digest - manualne wyzwolenie daily summary
+# ============================================================
+
+async def handle_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manualny daily digest - wszystko co sie dzialo."""
+    from .services import usage_stats
+
+    local = usage_stats.stats_local(window_hours=24)
+    directus = await usage_stats.stats_directus(window_hours=24)
+    mcp = await usage_stats.stats_mcp()
+
+    msg = "📊 UL OS Daily Digest\n\n"
+
+    # Ingest summary
+    if "error" not in directus:
+        msg += f"📥 Ostatnie 24h: {directus['recent_count']} nowych dokumentow\n"
+        msg += f"📊 Total w bazie: {directus['total']}\n"
+        for brand, cnt in sorted(directus["by_brand"].items(), key=lambda x: -x[1]):
+            msg += f"  • {brand}: {cnt}\n"
+
+    msg += f"\n🤖 Bot activity (24h):\n"
+    msg += f"  • Total events: {local['total_events']}\n"
+    msg += f"  • Estymata kosztow: $${local['est_cost_usd']:.4f}\n"
+    if local["rate_limited"] > 0:
+        msg += f"  • ⚠ Rate-limited: {local['rate_limited']}\n"
+
+    if "error" not in mcp:
+        msg += f"\n🧠 MCP Server:\n"
+        msg += f"  • Status: {mcp.get('status', '?')}\n"
+        msg += f"  • Tools: {mcp.get('tools_count', '?')}\n"
+        last_pull = mcp.get("vault_last_pulled", "")
+        if last_pull:
+            msg += f"  • Vault last pull: {last_pull[:19].replace('T', ' ')} UTC\n"
+
+    msg += "\n⚠ Alerts: brak\n"
+    msg += "\n(W produkcji - Worker DLQ + Anthropic real cost dolozymy w Sprint 1)"
+
+    await update.message.reply_text(msg)
+
+
+# ============================================================
+# /audit - przeglad ostatnich akcji (admin debug)
+# ============================================================
+
+async def handle_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Przeglad ostatnich 20 akcji z audit.jsonl."""
+    from . import audit as audit_mod
+
+    # Read last 20 lines z audit.jsonl
+    if not audit_mod.AUDIT_FILE.exists():
+        await update.message.reply_text("Audit log pusty.")
+        return
+
+    lines = []
+    try:
+        with open(audit_mod.AUDIT_FILE, encoding="utf-8") as f:
+            for line in f:
+                lines.append(line.strip())
+        lines = lines[-20:]  # last 20
+    except OSError as e:
+        await update.message.reply_text(f"Audit read error: {e}")
+        return
+
+    if not lines:
+        await update.message.reply_text("Audit log pusty.")
+        return
+
+    import json
+    msg = f"Audit log (ostatnie {len(lines)} akcji):\n\n"
+    for line in lines:
+        try:
+            e = json.loads(line)
+            ts = e.get("iso", "?")[:19].replace("T", " ")
+            user = e.get("username") or "system"
+            action = e.get("action", "?")
+            result = e.get("result", "?")
+            error = e.get("error")
+            args = e.get("args")
+
+            line_msg = f"[{ts}] @{user} /{action}={result}"
+            if args:
+                line_msg += f" ({args[:30]})"
+            if error and result != "ok":
+                line_msg += f" ⚠ {error[:40]}"
+            msg += line_msg + "\n"
+        except json.JSONDecodeError:
+            continue
+
+    # Telegram message limit: 4096 chars
+    if len(msg) > 3500:
+        msg = msg[:3500] + "\n... (truncated)"
+
+    await update.message.reply_text(msg)
