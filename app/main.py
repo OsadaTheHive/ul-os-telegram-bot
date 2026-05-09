@@ -28,7 +28,9 @@ from telegram.ext import (
     filters,
 )
 
-from . import audit, monitor
+from datetime import time as dt_time
+
+from . import audit, breaker, health_endpoint, monitor
 from .config import settings
 from .limiter import check as rate_check
 from .handlers import (
@@ -275,6 +277,21 @@ async def post_init(app: Application):
     if app.job_queue is not None:
         app.job_queue.run_repeating(monitor.tick, interval=300, first=60, name="health_monitor")
         log.info("Health monitor scheduled (interval=300s)")
+
+        # Daily digest 09:00 UTC (~11:00 PL czas zimowy / 11:00 PL letni)
+        from .handlers import handle_digest_auto
+        app.job_queue.run_daily(
+            handle_digest_auto,
+            time=dt_time(hour=9, minute=0),
+            name="daily_digest",
+        )
+        log.info("Daily digest scheduled (09:00 UTC daily)")
+
+    # HTTP health endpoint na port 8080 (dla zewnetrznego uptime monitora)
+    try:
+        await health_endpoint.start_health_server(port=8080)
+    except Exception as e:
+        log.warning("Health endpoint nie wstal (port 8080 zajety?): %s", e)
 
 
 def build_app() -> Application:

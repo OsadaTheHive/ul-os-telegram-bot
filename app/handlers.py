@@ -69,7 +69,14 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sprawdz Worker + Directus + MCP + B2 (jak juz beda)."""
+    from . import breaker as bk
     msg = "Status UL OS:\n"
+
+    # Circuit breakers state (jezeli ktorys OPEN - widac od razu)
+    breakers_status = bk.all_stats()
+    open_circuits = [n for n, s in breakers_status.items() if s["state"] == "open"]
+    if open_circuits:
+        msg += f" ⚠ Circuit OPEN: {', '.join(open_circuits)}\n"
 
     # Directus check
     try:
@@ -321,9 +328,19 @@ async def handle_ulos_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Plik wyslany do bota -> ack + (TODO) forward do Workera."""
+    """Plik wyslany do bota -> ack + idempotency check + (TODO) forward do Workera."""
+    from .idempotency import cache as idem_cache, telegram_file_key
     doc = update.message.document
     log.info("document received: name=%s size=%s mime=%s", doc.file_name, doc.file_size, doc.mime_type)
+
+    # Idempotency check
+    key = telegram_file_key(doc.file_id, doc.file_size)
+    if not idem_cache.check_and_mark(key):
+        await update.message.reply_text(
+            f"♻️ Plik {doc.file_name} juz wyslany w ostatniej godzinie - skip dedup."
+        )
+        return
+
     await update.message.reply_text(
         f"Otrzymalem: {doc.file_name}\n"
         f"Rozmiar: {doc.file_size / 1024 / 1024:.2f} MB\n"
@@ -467,6 +484,41 @@ async def handle_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 # /audit - przeglad ostatnich akcji (admin debug)
 # ============================================================
+
+async def handle_digest_auto(context: ContextTypes.DEFAULT_TYPE):
+    """Auto-trigger daily digest (z JobQueue, 09:00 UTC).
+
+    Wysyla do wszystkich admin_user_ids ten sam content co /digest.
+    """
+    from .services import usage_stats
+    from .config import settings
+
+    local = usage_stats.stats_local(window_hours=24)
+    directus = await usage_stats.stats_directus(window_hours=24)
+    mcp = await usage_stats.stats_mcp()
+
+    msg = "📊 UL OS Daily Digest (auto, 09:00)\n\n"
+
+    if "error" not in directus:
+        msg += f"📥 Ostatnie 24h: {directus['recent_count']} nowych dokumentow\n"
+        msg += f"📊 Total: {directus['total']}\n"
+
+    msg += f"\n🤖 Bot (24h): {local['total_events']} events, "
+    msg += f"~${local['est_cost_usd']:.4f} estymata\n"
+
+    if "error" not in mcp:
+        msg += f"🧠 MCP: {mcp.get('status', '?')}, {mcp.get('tools_count', '?')} tools\n"
+
+    if local["rate_limited"] > 0:
+        msg += f"\n⚠ Rate-limited: {local['rate_limited']}\n"
+
+    # Send do każdego admin
+    for chat_id in settings.admin_user_ids:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=msg)
+        except Exception as e:
+            log.error("Daily digest send failed for %s: %s", chat_id, e)
+
 
 async def handle_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Przeglad ostatnich 20 akcji z audit.jsonl."""

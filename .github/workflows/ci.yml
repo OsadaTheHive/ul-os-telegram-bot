@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest ruff
+
+      - name: Lint with ruff
+        run: ruff check app/ tests/
+
+      - name: Format check
+        run: ruff format --check app/ tests/
+
+      - name: Run tests
+        env:
+          TELEGRAM_BOT_TOKEN: "test_token"
+          ADMIN_CHAT_IDS: "123456"
+        run: pytest tests/ -v --tb=short
+
+  build-docker:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t ul-os-telegram-bot:${{ github.sha }} .
+
+      - name: Verify image health
+        run: |
+          # Spawn container, wait for health endpoint, kill it
+          docker run -d --name test-bot \
+            -e TELEGRAM_BOT_TOKEN=test_token \
+            -e ADMIN_CHAT_IDS=123456 \
+            ul-os-telegram-bot:${{ github.sha }}
+          sleep 10
+          docker logs test-bot
+          docker stop test-bot
+
+  deploy:
+    needs: [test, build-docker]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Trigger Coolify deploy
+        run: |
+          curl -X POST "${{ secrets.COOLIFY_DEPLOY_WEBHOOK }}" \
+            -H "Authorization: Bearer ${{ secrets.COOLIFY_TOKEN }}"
