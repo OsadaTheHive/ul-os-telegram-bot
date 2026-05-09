@@ -28,7 +28,9 @@ from telegram.ext import (
     filters,
 )
 
+from . import audit, monitor
 from .config import settings
+from .limiter import check as rate_check
 from .handlers import (
     handle_document,
     handle_help,
@@ -57,14 +59,80 @@ def is_authorized(update: Update) -> bool:
     """Whitelist check: only ADMIN_CHAT_IDS can use the bot."""
     if not update.effective_user:
         return False
-    return update.effective_user.id in settings.admin_chat_ids
+    return update.effective_user.id in settings.admin_user_ids
+
+
+def _action_key(update: Update) -> str:
+    """Dedukuj action key dla limiter/audit (np. 'produkt' dla /produkt)."""
+    if update.message:
+        if update.message.text and update.message.text.startswith("/"):
+            return update.message.text[1:].split()[0].split("@")[0]
+        if update.message.document:
+            return "document"
+        if update.message.photo:
+            return "photo"
+        if update.message.voice:
+            return "voice"
+    return "unknown"
+
+
+def _action_args(update: Update) -> str | None:
+    """Argumenty komendy do audit log."""
+    if update.message and update.message.text and update.message.text.startswith("/"):
+        parts = update.message.text.split(maxsplit=1)
+        if len(parts) > 1:
+            return parts[1][:200]  # Cap dlugości
+    return None
 
 
 async def authorized_or_ignore(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Wrapper - if user not in whitelist, send polite NO and log."""
+    """Wrapper - whitelist check + rate limiting + audit log.
+
+    Returns True jezeli mozna kontynuowac, False jezeli zablokowane (auth/limit).
+    """
+    user = update.effective_user
+    user_id = user.id if user else None
+    username = user.username if user else None
+    action = _action_key(update)
+    args = _action_args(update)
+
+    # 1. Auth check
     if not is_authorized(update):
+        audit.write(
+            user_id=user_id,
+            username=username,
+            action=action,
+            args=args,
+            result="denied",
+            error="unauthorized",
+        )
         await handle_unauthorized(update, context)
         return False
+
+    # 2. Rate limit check (only for authorized users)
+    if user_id is not None:
+        allowed, err_msg = rate_check(user_id, action)
+        if not allowed:
+            audit.write(
+                user_id=user_id,
+                username=username,
+                action=action,
+                args=args,
+                result="rate_limited",
+                error=err_msg,
+            )
+            if update.message:
+                await update.message.reply_text(f"⏱ {err_msg}")
+            return False
+
+    # 3. Audit success
+    audit.write(
+        user_id=user_id,
+        username=username,
+        action=action,
+        args=args,
+        result="ok",
+    )
     return True
 
 
@@ -159,8 +227,22 @@ async def post_init(app: Application):
         "Bot started: @%s (id=%s), whitelist=%s",
         (await app.bot.get_me()).username,
         (await app.bot.get_me()).id,
-        list(settings.admin_chat_ids),
+        list(settings.admin_user_ids),
     )
+
+    # Startup audit
+    audit.write(
+        user_id=None,
+        username="system",
+        action="bot_startup",
+        result="ok",
+        extra={"whitelist_size": len(settings.admin_user_ids)},
+    )
+
+    # Background health monitor: pierwsza po 60s (warm up), potem co 5 min
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(monitor.tick, interval=300, first=60, name="health_monitor")
+        log.info("Health monitor scheduled (interval=300s)")
 
 
 def build_app() -> Application:

@@ -4,7 +4,7 @@ Konfiguracja bota - czytane z env vars.
 
 from __future__ import annotations
 
-from pydantic import Field, field_validator
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,21 +17,16 @@ class Settings(BaseSettings):
 
     # Telegram
     telegram_bot_token: str = Field(...)
-    admin_chat_ids: frozenset[int] = Field(default=frozenset())
+    # Raw CSV string z .env - parsowany przez admin_user_ids property.
+    # Bezpośrednio jako frozenset[int] nie da rady bo pydantic-settings probuje JSON.
+    admin_chat_ids: str = Field(default="")
 
-    @field_validator("admin_chat_ids", mode="before")
-    @classmethod
-    def _parse_admin_chat_ids(cls, v):
-        # accept "id1,id2,id3" string z .env, lub list/tuple/frozenset, lub pojedynczy int
-        if v is None or v == "":
-            return frozenset()
-        if isinstance(v, (list, tuple, set, frozenset)):
-            return frozenset(int(x) for x in v if str(x).strip())
-        if isinstance(v, int):
-            return frozenset([v])
-        if isinstance(v, str):
-            return frozenset(int(x.strip()) for x in v.split(",") if x.strip())
-        return v
+    @property
+    def admin_user_ids(self) -> frozenset[int]:
+        """Sparsowany ADMIN_CHAT_IDS jako frozenset[int]. Pusty string → empty."""
+        return frozenset(
+            int(x.strip()) for x in self.admin_chat_ids.split(",") if x.strip()
+        )
 
     # Mode
     use_webhook: bool = Field(default=False)
