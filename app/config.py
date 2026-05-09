@@ -45,11 +45,12 @@ class Settings(BaseSettings):
     mcp_base_url: str = Field(default="https://mcp.bidbee.pl")
     mcp_bearer_token: str = Field(default="")
 
-    # Storage
-    b2_endpoint: str = Field(default="")
-    b2_bucket_archive: str = Field(default="ul-os-archive")
-    b2_application_key_id: str = Field(default="")
-    b2_application_key: str = Field(default="")
+    # Storage — Hetzner Object Storage (per ADR-001 z 2026-05-09, supersedes B2 plan)
+    s3_endpoint: str = Field(default="")  # np. https://nbg1.your-objectstorage.com
+    s3_bucket: str = Field(default="ul-os-storage")  # bucket startowy w Nuremberg
+    s3_access_key_id: str = Field(default="")
+    s3_secret_access_key: str = Field(default="")
+    s3_region: str = Field(default="nbg1")
 
     # Tenant (per ADR-008)
     tenant_id: str = Field(default="hivelive_ecosystem")

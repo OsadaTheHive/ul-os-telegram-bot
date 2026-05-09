@@ -118,11 +118,11 @@ async def handle_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         msg += " * Worker: nie skonfigurowany (Tier 0 milestone)\n"
 
-    # B2 check (placeholder)
-    if settings.b2_application_key_id:
-        msg += " * Backblaze B2: skonfigurowany\n"
+    # Hetzner Object Storage check (per ADR-001, supersedes B2 plan)
+    if settings.s3_access_key_id:
+        msg += f" * Hetzner Object Storage: skonfigurowany (bucket: {settings.s3_bucket})\n"
     else:
-        msg += " * Backblaze B2: brak kluczy (Tier 0 milestone)\n"
+        msg += " * Hetzner Object Storage: brak kluczy (Tier 0 milestone)\n"
 
     await update.message.reply_text(msg)
 
