@@ -463,43 +463,109 @@ async def handle_ulos_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"Blad: {e}")
 
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Plik wyslany do bota -> ack + idempotency check + (TODO) forward do Workera."""
+async def _forward_to_worker(
+    update: Update,
+    *,
+    file_id: str,
+    file_size: int,
+    filename: str,
+    mime_type: str | None,
+    ack_prefix: str,
+) -> None:
+    """
+    Wspolne: pobiera plik z Telegrama, wgrywa do HOS inbox/, replikuje ack.
+    Worker UL OS (mode=hos) wykryje plik w max 30s.
+    """
     from .idempotency import cache as idem_cache, telegram_file_key
-    doc = update.message.document
-    log.info("document received: name=%s size=%s mime=%s", doc.file_name, doc.file_size, doc.mime_type)
+    from .services.hos_uploader import upload_telegram_file
 
     # Idempotency check
-    key = telegram_file_key(doc.file_id, doc.file_size)
+    key = telegram_file_key(file_id, file_size)
     if not idem_cache.check_and_mark(key):
         await update.message.reply_text(
-            f"♻️ Plik {doc.file_name} juz wyslany w ostatniej godzinie - skip dedup."
+            f"♻️ Plik {filename} juz wyslany w ostatniej godzinie - skip dedup."
         )
         return
 
-    await update.message.reply_text(
-        f"Otrzymalem: {doc.file_name}\n"
-        f"Rozmiar: {doc.file_size / 1024 / 1024:.2f} MB\n"
-        f"Typ: {doc.mime_type}\n\n"
-        "(WIP - po Tier 0 plik trafi do INBOX i Worker UL OS go przetworzy)"
+    user = update.effective_user
+    user_id = user.id if user else 0
+    username = user.username if user else None
+
+    status_msg = await update.message.reply_text(
+        f"{ack_prefix} {filename}\n"
+        f"Rozmiar: {file_size / 1024 / 1024:.2f} MB\n"
+        f"⬆️  Wgrywam do HOS inbox/..."
+    )
+
+    try:
+        tg_file = await update.message.get_bot().get_file(file_id)
+        data = await tg_file.download_as_bytearray()
+        result = await upload_telegram_file(
+            data=bytes(data),
+            filename=filename,
+            mime_type=mime_type,
+            telegram_user_id=user_id,
+            telegram_username=username,
+        )
+        if result.success:
+            await status_msg.edit_text(
+                f"✅ {filename}\n"
+                f"Wgrany do HOS inbox/\n"
+                f"Klucz: {result.s3_key}\n"
+                f"Rozmiar: {result.bytes_uploaded / 1024 / 1024:.2f} MB\n\n"
+                f"⏱️ Worker UL OS przetworzy w ciagu max 30 sek "
+                f"(klasyfikacja Anthropic → Directus + Vault + HOS attachment)."
+            )
+        else:
+            await status_msg.edit_text(
+                f"❌ {filename}\n"
+                f"Blad uploadu do HOS: {result.error}\n\n"
+                f"Sprawdz konfiguracje S3_* envs bota."
+            )
+    except Exception as e:
+        log.exception("forward_to_worker fail filename=%s", filename)
+        await status_msg.edit_text(f"❌ Blad pobierania/uploadu: {e}")
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Plik (PDF/DOCX/XLSX/CSV/ZIP) -> HOS inbox/ -> Worker UL OS w 30s."""
+    doc = update.message.document
+    log.info("document received: name=%s size=%s mime=%s", doc.file_name, doc.file_size, doc.mime_type)
+    await _forward_to_worker(
+        update,
+        file_id=doc.file_id,
+        file_size=doc.file_size or 0,
+        filename=doc.file_name or f"document_{doc.file_id}.bin",
+        mime_type=doc.mime_type,
+        ack_prefix="📄 Dokument:",
     )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Zdjecie (najwiekszy rozmiar) -> HOS inbox/ -> Worker multimodal AI."""
     photo = update.message.photo[-1]  # najwiekszy rozmiar
     log.info("photo received: file_id=%s size=%s", photo.file_id, photo.file_size)
-    await update.message.reply_text(
-        f"Otrzymalem foto ({photo.file_size / 1024:.0f} KB).\n\n"
-        "(WIP - multimodal AI opisze foto + klasyfikator po Tier 0)"
+    await _forward_to_worker(
+        update,
+        file_id=photo.file_id,
+        file_size=photo.file_size or 0,
+        filename=f"telegram_photo_{photo.file_unique_id}.jpg",
+        mime_type="image/jpeg",
+        ack_prefix="🖼️  Foto:",
     )
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Voice memo (OGG opus) -> HOS inbox/ -> Worker (Whisper transkrypcja w roadmapie)."""
     voice = update.message.voice
     log.info("voice received: duration=%ss size=%s", voice.duration, voice.file_size)
-    await update.message.reply_text(
-        f"Otrzymalem voice memo ({voice.duration}s).\n\n"
-        "(WIP - Whisper transkrypcja w Q3 2026 wg roadmapy)"
+    await _forward_to_worker(
+        update,
+        file_id=voice.file_id,
+        file_size=voice.file_size or 0,
+        filename=f"telegram_voice_{voice.file_unique_id}_{voice.duration}s.ogg",
+        mime_type=voice.mime_type or "audio/ogg",
+        ack_prefix="🎙️  Voice:",
     )
 
 

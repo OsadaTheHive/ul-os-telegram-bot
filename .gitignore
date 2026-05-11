@@ -28,3 +28,4 @@ dist/
 build/
 *.egg-info/
 logs/
+.env*

@@ -51,6 +51,8 @@ class Settings(BaseSettings):
     s3_access_key_id: str = Field(default="")
     s3_secret_access_key: str = Field(default="")
     s3_region: str = Field(default="nbg1")
+    # Prefix do ktorego bot uploaduje pliki. Worker (mode=hos) polluje ten sam prefix.
+    s3_inbox_prefix: str = Field(default="inbox/")
 
     # Tenant (per ADR-008)
     tenant_id: str = Field(default="hivelive_ecosystem")
