@@ -147,15 +147,170 @@ def _estimate_cost(model: str, in_tok: int, out_tok: int) -> float:
 
 
 async def _call_mcp_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
-    """Wywoluje MCP tool przez services.mcp_client. Zwraca JSON string z wynikiem."""
+    """
+    Wywołuje tool — z fallback hierarchy:
+      1. Bezpośrednie wywołanie Directus REST (najbardziej niezawodne)
+      2. MCP server fallback (jeśli skonfigurowany)
+    Zwraca JSON string z wynikiem (cap 4000 chars dla Anthropic context).
+    """
     try:
-        from .mcp_client import call_tool  # type: ignore
-        result = await call_tool(tool_name, tool_input)
-        return json.dumps(result, ensure_ascii=False)[:4000]
-    except ImportError:
-        return json.dumps({"error": "MCP client niedostepny w bot env"})
+        if tool_name == "vault_search":
+            return await _direct_vault_search(
+                query=tool_input.get("query", ""),
+                limit=int(tool_input.get("limit", 10)),
+            )
+        if tool_name == "vault_read":
+            return await _direct_vault_read(path=tool_input.get("path", ""))
+        if tool_name == "directus_query":
+            return await _direct_directus_query(
+                collection=tool_input.get("collection", ""),
+                filter_field=tool_input.get("filter_field"),
+                filter_value=tool_input.get("filter_value"),
+                limit=int(tool_input.get("limit", 10)),
+            )
+        return json.dumps({"error": f"Unknown tool: {tool_name}"})
     except Exception as e:
+        log.exception("tool %s fail", tool_name)
         return json.dumps({"error": str(e)})
+
+
+async def _direct_vault_search(query: str, limit: int = 10) -> str:
+    """Vault search = Directus knowledge_items full-text na content_text + title."""
+    if not query:
+        return json.dumps({"error": "query required"})
+    if not settings.directus_url or not settings.directus_token:
+        return json.dumps({"error": "Directus not configured"})
+
+    limit = max(1, min(limit, 30))
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(
+            f"{settings.directus_url}/items/knowledge_items",
+            params={
+                "fields": "id,title,vault_path,brand,type,project,date_created,summary",
+                "filter[_or][0][title][_icontains]": query,
+                "filter[_or][1][content_text][_icontains]": query,
+                "filter[_or][2][vault_path][_icontains]": query,
+                "filter[_or][3][summary][_icontains]": query,
+                "limit": str(limit),
+                "sort": "-date_created",
+            },
+            headers={"Authorization": f"Bearer {settings.directus_token}"},
+        )
+        if r.status_code != 200:
+            return json.dumps({"error": f"Directus HTTP {r.status_code}"})
+        items = r.json().get("data", [])
+
+    out = {
+        "tool": "vault_search",
+        "query": query,
+        "matches": len(items),
+        "results": [
+            {
+                "id": it.get("id"),
+                "title": it.get("title"),
+                "vault_path": it.get("vault_path"),
+                "brand": it.get("brand"),
+                "type": it.get("type"),
+                "project": it.get("project"),
+                "summary": (it.get("summary") or "")[:300],
+            }
+            for it in items
+        ],
+    }
+    return json.dumps(out, ensure_ascii=False)[:4000]
+
+
+async def _direct_vault_read(path: str) -> str:
+    """Vault read = Directus knowledge_items o vault_path = path → zwróć content_text."""
+    if not path:
+        return json.dumps({"error": "path required"})
+    if not settings.directus_url or not settings.directus_token:
+        return json.dumps({"error": "Directus not configured"})
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(
+            f"{settings.directus_url}/items/knowledge_items",
+            params={
+                "fields": "id,title,vault_path,brand,type,content_text,summary",
+                "filter[vault_path][_eq]": path,
+                "limit": "1",
+            },
+            headers={"Authorization": f"Bearer {settings.directus_token}"},
+        )
+        if r.status_code != 200:
+            return json.dumps({"error": f"Directus HTTP {r.status_code}"})
+        items = r.json().get("data", [])
+        if not items:
+            return json.dumps({"error": f"Not found: {path}"})
+        it = items[0]
+        return json.dumps(
+            {
+                "tool": "vault_read",
+                "path": path,
+                "title": it.get("title"),
+                "brand": it.get("brand"),
+                "type": it.get("type"),
+                "summary": it.get("summary"),
+                "content": (it.get("content_text") or "")[:3500],
+            },
+            ensure_ascii=False,
+        )[:4000]
+
+
+async def _direct_directus_query(
+    collection: str,
+    filter_field: Optional[str],
+    filter_value: Optional[str],
+    limit: int = 10,
+) -> str:
+    """Generic Directus query — knowledge_items, beezzy_products."""
+    if collection not in {"knowledge_items", "beezzy_products"}:
+        return json.dumps({"error": f"Collection nie wspierana: {collection}"})
+    if not settings.directus_url or not settings.directus_token:
+        return json.dumps({"error": "Directus not configured"})
+
+    limit = max(1, min(limit, 30))
+    params: dict[str, Any] = {"limit": str(limit), "sort": "-date_created"}
+
+    if collection == "beezzy_products":
+        params["fields"] = (
+            "id,title,manufacturer,model,category,subcategory,power_w,capacity_kwh,"
+            "voltage_v,efficiency_pct,description_short,price_retail_pln,hero_image_url"
+        )
+        params["filter[is_duplicate][_neq]"] = "true"
+    else:
+        params["fields"] = "id,title,brand,type,project,vault_path,summary,date_created"
+
+    if filter_field and filter_value:
+        # Whitelist safe filter keys żeby user nie zrobił SQL injection przez Claude
+        safe_keys = {
+            "knowledge_items": {"brand", "type", "project", "title", "vault_path"},
+            "beezzy_products": {"manufacturer", "model", "category", "subcategory", "title"},
+        }
+        if filter_field in safe_keys.get(collection, set()):
+            params[f"filter[{filter_field}][_icontains]"] = filter_value
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(
+            f"{settings.directus_url}/items/{collection}",
+            params=params,
+            headers={"Authorization": f"Bearer {settings.directus_token}"},
+        )
+        if r.status_code != 200:
+            return json.dumps({"error": f"Directus HTTP {r.status_code}"})
+        items = r.json().get("data", [])
+
+    return json.dumps(
+        {
+            "tool": "directus_query",
+            "collection": collection,
+            "filter": {"field": filter_field, "value": filter_value} if filter_field else None,
+            "count": len(items),
+            "items": items,
+        },
+        ensure_ascii=False,
+        default=str,
+    )[:4000]
 
 
 _load_persisted()

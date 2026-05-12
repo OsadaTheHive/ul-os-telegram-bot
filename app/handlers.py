@@ -556,17 +556,125 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Voice memo (OGG opus) -> HOS inbox/ -> Worker (Whisper transkrypcja w roadmapie)."""
+    """
+    Voice memo (OGG opus) -> Whisper local transkrypcja -> markdown -> HOS inbox/ -> Worker.
+
+    Sprint 1.8: lokalna transkrypcja przez whisper.cpp (ggml-large.bin z Aiko).
+    Zero kosztu OpenAI API. Worker dostaje gotowy markdown z transkrypcją do klasyfikacji.
+    """
+    from .idempotency import cache as idem_cache, telegram_file_key
+    from .services.whisper_local import transcribe
+    from .services.hos_uploader import upload_telegram_file
+
     voice = update.message.voice
     log.info("voice received: duration=%ss size=%s", voice.duration, voice.file_size)
-    await _forward_to_worker(
-        update,
-        file_id=voice.file_id,
-        file_size=voice.file_size or 0,
-        filename=f"telegram_voice_{voice.file_unique_id}_{voice.duration}s.ogg",
-        mime_type=voice.mime_type or "audio/ogg",
-        ack_prefix="🎙️  Voice:",
+
+    # Idempotency check
+    key = telegram_file_key(voice.file_id, voice.file_size or 0)
+    if not idem_cache.check_and_mark(key):
+        await update.message.reply_text("♻️ Voice juz wyslany w ostatniej godzinie - skip dedup.")
+        return
+
+    user = update.effective_user
+    user_id = user.id if user else 0
+    username = user.username if user else None
+    duration = voice.duration or 0
+
+    status_msg = await update.message.reply_text(
+        f"🎙️  Voice ({duration}s, {(voice.file_size or 0)/1024:.0f} KB)\n"
+        f"⬇️  Pobieram z Telegrama...\n"
+        f"🔊 Transkrybuję przez Whisper (local ggml-large)..."
     )
+
+    try:
+        # 1. Download bytes
+        tg_file = await update.message.get_bot().get_file(voice.file_id)
+        audio_bytes = bytes(await tg_file.download_as_bytearray())
+
+        # 2. Whisper local transcription
+        await status_msg.edit_text(
+            f"🎙️  Voice ({duration}s)\n"
+            f"🔊 Whisper transkrybuje... (zwykle 2-15s)"
+        )
+        tr = await transcribe(audio_bytes, source_extension=".ogg")
+
+        if not tr.success:
+            # Fallback: upload tylko OGG (bez transkrypcji) — Worker zapisze jako attachment
+            await status_msg.edit_text(
+                f"⚠️  Whisper fail: {tr.error}\n"
+                f"⬆️  Upload OGG bez transkrypcji..."
+            )
+            await _forward_to_worker(
+                update,
+                file_id=voice.file_id,
+                file_size=voice.file_size or 0,
+                filename=f"telegram_voice_{voice.file_unique_id}_{duration}s.ogg",
+                mime_type=voice.mime_type or "audio/ogg",
+                ack_prefix="🎙️  Voice (raw):",
+            )
+            return
+
+        # 3. Build markdown z frontmatter
+        from datetime import datetime, timezone as _tz
+        date = datetime.now(_tz.utc).strftime("%Y-%m-%d")
+        ts = datetime.now(_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
+        preview = tr.text[:200]
+
+        markdown = (
+            f"---\n"
+            f"type: notatka_voice\n"
+            f"source: telegram_voice\n"
+            f"date: {date}\n"
+            f"tg_user: {username or user_id}\n"
+            f"duration_sec: {duration}\n"
+            f"transcribed_by: whisper.cpp ({tr.model_used})\n"
+            f"language: pl\n"
+            f"---\n\n"
+            f"# Voice memo — {ts}\n\n"
+            f"**Nadawca:** {username or f'user_{user_id}'}\n"
+            f"**Czas trwania:** {duration} sekund\n"
+            f"**Model transkrypcji:** {tr.model_used}\n\n"
+            f"## Transkrypcja\n\n"
+            f"{tr.text}\n"
+        )
+
+        # 4. Upload markdown do HOS inbox/ (worker przeczyta i sklasyfikuje)
+        await status_msg.edit_text(
+            f"🎙️  Voice ({duration}s) → transkrypcja gotowa\n\n"
+            f"📝 \"{preview}{'...' if len(tr.text) > 200 else ''}\"\n\n"
+            f"⬆️  Upload markdown do HOS..."
+        )
+
+        upload = await upload_telegram_file(
+            data=markdown.encode("utf-8"),
+            filename=f"voice_{voice.file_unique_id}_{duration}s_transkrypcja.md",
+            mime_type="text/markdown",
+            telegram_user_id=user_id,
+            telegram_username=username,
+            extra_metadata={
+                "ulos-source": "telegram_voice",
+                "ulos-duration-sec": str(duration),
+                "ulos-whisper-model": tr.model_used,
+            },
+        )
+
+        if upload.success:
+            await status_msg.edit_text(
+                f"✅ Voice ({duration}s) → transkrypcja + upload OK\n\n"
+                f"📝 \"{preview}{'...' if len(tr.text) > 200 else ''}\"\n\n"
+                f"🗂️ HOS: {upload.s3_key}\n"
+                f"⏱️ Worker przetworzy w ~30s (klasyfikator → Directus + Vault)\n"
+                f"🎯 Whisper: {tr.model_used}, znaków: {len(tr.text)}"
+            )
+        else:
+            await status_msg.edit_text(
+                f"⚠️  Transkrypcja OK ale upload fail: {upload.error}\n\n"
+                f"Transkrypcja (zachowaj recznie):\n{tr.text[:1500]}"
+            )
+
+    except Exception as e:
+        log.exception("voice handler failed")
+        await status_msg.edit_text(f"❌ Voice handler crash: {e}")
 
 
 # ============================================================
