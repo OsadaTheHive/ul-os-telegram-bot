@@ -1121,39 +1121,43 @@ async def handle_research(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if not settings.perplexity_api_key:
+    # Sprint 1.7 v2: domyślnie Anthropic web_search (klucz mamy aktywny),
+    # fallback Perplexity jeśli RESEARCH_PROVIDER=perplexity + PERPLEXITY_API_KEY.
+    if not (settings.anthropic_api_key or settings.perplexity_api_key):
         await update.message.reply_text(
-            "⚠️ Perplexity API key nie skonfigurowany.\n\n"
-            "Aby aktywować Sprint 1.7 Research Bot:\n"
-            "1. Załóż konto na https://perplexity.ai/settings/api ($5-20/mies)\n"
-            "2. Skopiuj API key\n"
-            "3. Wpisz do .env: PERPLEXITY_API_KEY=pplx-...\n"
-            "4. Restart bota: launchctl unload+load com.ulos.telegram-bot.plist"
+            "⚠️ Brak ANTHROPIC_API_KEY (default) ani PERPLEXITY_API_KEY (fallback).\n\n"
+            "Aby aktywować /research:\n"
+            "• Default (Anthropic web_search): wystarczy ANTHROPIC_API_KEY w .env\n"
+            "• Alternatywa Perplexity: PERPLEXITY_API_KEY + RESEARCH_PROVIDER=perplexity"
         )
         return
 
-    from .services import perplexity
+    from .services import research
     prompt = " ".join(context.args).strip()
 
     progress = await update.message.reply_text(
-        f"🔍 Perplexity Deep Research:\n  {prompt[:120]}{'...' if len(prompt)>120 else ''}\n\n"
-        "Proszę czekać (zwykle 30-60s)..."
+        f"🔍 Research:\n  {prompt[:120]}{'...' if len(prompt)>120 else ''}\n\n"
+        "Provider: Claude + web_search + vault_search\n"
+        "Proszę czekać (zwykle 20-60s)..."
     )
 
     try:
-        result = await perplexity.research(prompt)
+        result = await research.research(prompt)
         if result.success:
             user = update.effective_user
-            uploaded = await perplexity.upload_to_inbox(
+            uploaded = await research.upload_to_inbox(
                 result.markdown,
                 prompt=prompt,
+                provider=result.provider,
                 telegram_user_id=user.id if user else 0,
                 telegram_username=user.username if user else None,
             )
+            web_str = f"🌐 web_search: {result.web_search_count}" if result.web_search_count else ""
             await progress.edit_text(
-                f"✅ Analiza gotowa!\n\n"
+                f"✅ Research gotowy! ({result.provider})\n\n"
                 f"📋 Prompt: {prompt[:100]}{'...' if len(prompt)>100 else ''}\n"
                 f"📊 Tokens: {result.input_tokens} in / {result.output_tokens} out\n"
+                f"{web_str}\n"
                 f"💰 Cost: ~${result.cost_usd:.4f}\n"
                 f"📚 Citations: {len(result.citations)}\n\n"
                 f"🗂️ HOS: {uploaded.s3_key}\n"
