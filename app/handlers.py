@@ -734,14 +734,24 @@ async def handle_koszty(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_dlq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Lista failed items w HOS DLQ (inbox-failed/).
+    Lista / retry failed items w HOS DLQ (inbox-failed/).
 
-    Worker UL OS (mode=hos) zapisuje failed plik z S3 metadata x-worker-error.
-    Tutaj pokazujemy ostatnie N rekordow z error message + filename + size + data.
+    Sprint 1.5 + retry:
+      /dlq                        — top 10 failed (default)
+      /dlq 20                     — top 20 failed
+      /dlq retry <key>            — przerzuć konkretny key z inbox-failed/ do inbox/
+      /dlq retry all              — przerzuć wszystkie (max 50)
+      /dlq retry 2026-05-11       — przerzuć tylko z konkretnej daty
 
-    Opcjonalny arg: /dlq 20 = pokaz top 20 (default 10, max 50).
+    Worker (mode=hos) podniesie retry-pliki z prefixem `retry-<ts>-<filename>`
+    i spróbuje przetworzyć ponownie. Idempotent — kasuje źródło po sukcesie copy.
     """
     from .services import dlq
+
+    # Subcomenda /dlq retry ...
+    if context.args and context.args[0].lower() == "retry":
+        await _handle_dlq_retry(update, context, context.args[1:])
+        return
 
     limit = 10
     if context.args:
@@ -1235,3 +1245,203 @@ async def handle_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception("ask failed")
         await progress.edit_text(f"❌ Blad: {e}")
+
+
+# ============================================================
+# /dlq retry — przerzuć failed z powrotem do inbox/
+# Sprint 1.5+ operational
+# ============================================================
+
+async def _handle_dlq_retry(update: Update, context: ContextTypes.DEFAULT_TYPE, args: list[str]):
+    """
+    Subcomenda dla /dlq retry. Args:
+      ['<inbox-failed/...>']  — retry konkretnego key
+      ['all']                  — retry wszystkich (max 50)
+      ['all', 'YYYY-MM-DD']    — retry tylko z konkretnej daty
+      ['YYYY-MM-DD']           — retry z konkretnej daty (alias)
+    """
+    from .services import dlq
+
+    if not args:
+        await update.message.reply_text(
+            "Uzycie:\n"
+            "  /dlq retry <inbox-failed/.../file>  — przerzuc konkretny\n"
+            "  /dlq retry all                       — przerzuc wszystkie (max 50)\n"
+            "  /dlq retry 2026-05-11                — przerzuc tylko z daty"
+        )
+        return
+
+    arg = args[0]
+    # Pattern: inbox-failed/...
+    if arg.startswith("inbox-failed/"):
+        progress = await update.message.reply_text(f"⏳ Retry: {arg[:80]}...")
+        result = await dlq.retry_dlq_item(arg)
+        if result.success:
+            await progress.edit_text(
+                f"✅ Retry OK\n\n"
+                f"From: {result.moved_from}\n"
+                f"To:   {result.moved_to}\n\n"
+                f"⏱️  Worker przerobi w ~30s"
+            )
+        else:
+            await progress.edit_text(f"❌ Retry fail: {result.error}")
+        return
+
+    # Pattern: 'all' lub 'YYYY-MM-DD'
+    date_filter = None
+    if arg.lower() != "all":
+        # Sprawdź czy format daty
+        import re
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", arg):
+            date_filter = arg
+        else:
+            await update.message.reply_text(
+                f"Nieznany argument: {arg}\n"
+                "Uzyj 'all', 'YYYY-MM-DD' lub pelny klucz inbox-failed/..."
+            )
+            return
+
+    # Args[1] może być date po 'all'
+    if arg.lower() == "all" and len(args) > 1:
+        import re
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", args[1]):
+            date_filter = args[1]
+
+    progress = await update.message.reply_text(
+        f"⏳ Bulk retry: filter={date_filter or 'all'}, max=50..."
+    )
+    result = await dlq.retry_all_dlq(date_filter=date_filter, max_items=50)
+
+    msg = (
+        f"📋 Bulk retry done\n\n"
+        f"Filter: {result.get('filter', '?')}\n"
+        f"✅ Przerzucone: {result.get('moved', 0)}\n"
+        f"❌ Bledy: {result.get('errors', 0)}\n\n"
+    )
+    log_items = result.get("log", [])
+    if log_items:
+        msg += "Detale:\n"
+        for line in log_items[:15]:
+            msg += f"  {line[:80]}\n"
+        if len(log_items) > 15:
+            msg += f"  …(+{len(log_items)-15} more)\n"
+
+    if len(msg) > 3900:
+        msg = msg[:3900] + "\n…"
+    await progress.edit_text(msg)
+
+
+# ============================================================
+# /upload-stats — statystyki upload per user (z audit log + S3)
+# Sprint 2 — operacyjne
+# ============================================================
+
+async def handle_upload_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Statystyki upload: dziś / 7d / 30d, per user, breakdown po typie pliku.
+
+    Z audit.jsonl (lokalny) + S3 inbox-processed/.
+
+    Argumenty: /upload-stats [days]  default 7
+    """
+    from datetime import datetime, timedelta, timezone as _tz
+    import json as _json
+    from pathlib import Path as _Path
+
+    days = 7
+    if context.args:
+        try:
+            days = max(1, min(int(context.args[0]), 90))
+        except ValueError:
+            pass
+
+    now = datetime.now(_tz.utc)
+    cutoff = now - timedelta(days=days)
+
+    # 1. Audit log analiza
+    audit_path = _Path("logs/audit.jsonl")
+    if not audit_path.exists():
+        await update.message.reply_text("Brak audit.jsonl")
+        return
+
+    by_user: dict[str, dict[str, int]] = {}
+    by_type: dict[str, int] = {}
+    total = 0
+    by_day: dict[str, int] = {}
+
+    try:
+        with open(audit_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = _json.loads(line)
+                except _json.JSONDecodeError:
+                    continue
+
+                action = e.get("action", "")
+                # Tylko zdarzenia upload (handle_document/photo/voice)
+                if action not in ("document", "photo", "voice"):
+                    continue
+
+                iso = e.get("iso", "")
+                try:
+                    ts = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                if ts < cutoff:
+                    continue
+
+                user = e.get("username") or f"user_{e.get('user_id', '?')}"
+                if user not in by_user:
+                    by_user[user] = {"total": 0, "document": 0, "photo": 0, "voice": 0}
+                by_user[user]["total"] += 1
+                by_user[user][action] = by_user[user].get(action, 0) + 1
+
+                by_type[action] = by_type.get(action, 0) + 1
+                total += 1
+
+                day = ts.strftime("%Y-%m-%d")
+                by_day[day] = by_day.get(day, 0) + 1
+    except Exception as e:
+        await update.message.reply_text(f"❌ Audit parse fail: {e}")
+        return
+
+    if total == 0:
+        await update.message.reply_text(
+            f"📊 Upload stats — ostatnie {days} dni\n\nBrak uploadów."
+        )
+        return
+
+    lines = [f"📊 Upload stats — ostatnie {days} dni"]
+    lines.append("")
+    lines.append(f"Razem: {total} uploads")
+    lines.append("")
+
+    # By type
+    lines.append("Po typie:")
+    for t in ["document", "photo", "voice"]:
+        count = by_type.get(t, 0)
+        if count:
+            emoji = {"document": "📄", "photo": "🖼️", "voice": "🎙️"}[t]
+            lines.append(f"  {emoji} {t}: {count}")
+    lines.append("")
+
+    # By user
+    lines.append("Po użytkowniku:")
+    for u, stats in sorted(by_user.items(), key=lambda x: -x[1]["total"]):
+        lines.append(
+            f"  @{u}: {stats['total']} "
+            f"(doc {stats.get('document', 0)} / foto {stats.get('photo', 0)} / voice {stats.get('voice', 0)})"
+        )
+    lines.append("")
+
+    # By day (last 7 dni)
+    if days <= 14:
+        lines.append("Po dniu:")
+        for day in sorted(by_day.keys(), reverse=True):
+            bar = "█" * min(by_day[day], 20)
+            lines.append(f"  {day}: {by_day[day]:3d} {bar}")
+
+    await update.message.reply_text("\n".join(lines))

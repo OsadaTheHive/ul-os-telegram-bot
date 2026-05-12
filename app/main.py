@@ -53,6 +53,7 @@ from .handlers import (
     handle_ostatnie,
     handle_research,
     handle_status,
+    handle_upload_stats,
     handle_photo,
     handle_produkt,
     handle_start,
@@ -282,6 +283,12 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_ask(update, context)
 
 
+async def cmd_upload_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorized_or_ignore(update, context):
+        return
+    await handle_upload_stats(update, context)
+
+
 async def msg_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorized_or_ignore(update, context):
         return
@@ -325,6 +332,7 @@ async def post_init(app: Application):
             BotCommand("generate", "/generate <vault-path> → DOCX z Vault + papier firmowy"),
             BotCommand("research", "/research <prompt> → Perplexity Deep Research → Vault"),
             BotCommand("ask", "/ask <pytanie> → Claude z dostępem do Vault (multi-turn)"),
+            BotCommand("upload_stats", "Statystyki upload per user (dziś/7d/30d)"),
         ]
     )
     log.info(
@@ -406,6 +414,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("generate", cmd_generate))
     app.add_handler(CommandHandler("research", cmd_research))
     app.add_handler(CommandHandler("ask", cmd_ask))
+    app.add_handler(CommandHandler("upload_stats", cmd_upload_stats))
+    app.add_handler(CommandHandler("uploadstats", cmd_upload_stats))  # alias
 
     app.add_handler(MessageHandler(filters.Document.ALL, msg_document))
     app.add_handler(MessageHandler(filters.PHOTO, msg_photo))

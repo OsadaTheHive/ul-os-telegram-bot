@@ -166,3 +166,112 @@ async def list_dlq_items(limit: int = 10) -> dict[str, Any]:
         "items": items,
         "total": total,
     }
+
+
+# === Retry (Sprint 1.5+ — operacyjna obsługa DLQ) ===
+
+@dataclass
+class RetryResult:
+    success: bool
+    moved_from: str = ""
+    moved_to: str = ""
+    error: Optional[str] = None
+
+
+def _retry_sync(failed_key: str) -> RetryResult:
+    """Kopiuj z inbox-failed/.../<file> → inbox/<file>, potem usuń źródło."""
+    client = _build_client()
+
+    # Sprawdź czy źródło istnieje
+    try:
+        client.head_object(Bucket=settings.s3_bucket, Key=failed_key)
+    except ClientError as e:
+        err = e.response.get("Error", {})
+        return RetryResult(success=False, error=f"Source not found: {err.get('Code')}")
+
+    # Wyciągnij nazwę pliku z klucza (ostatni segment)
+    filename = failed_key.split("/")[-1]
+    # Dodaj timestamp prefix żeby uniknąć kolizji + wskazać że to retry
+    retry_prefix = settings.s3_inbox_prefix or "inbox/"
+    retry_prefix = retry_prefix.rstrip("/") + "/"
+    new_key = f"{retry_prefix}retry-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{filename}"
+
+    # S3 metadata wymaga ASCII tylko — sanityzujemy polskie znaki
+    safe_from = failed_key.encode("ascii", "replace").decode("ascii").replace("?", "_")[:1000]
+    try:
+        # Server-side copy
+        client.copy_object(
+            Bucket=settings.s3_bucket,
+            CopySource={"Bucket": settings.s3_bucket, "Key": failed_key},
+            Key=new_key,
+            MetadataDirective="REPLACE",
+            Metadata={
+                "ulos-retry-from": safe_from,
+                "ulos-retry-at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        # Delete original z inbox-failed/
+        client.delete_object(Bucket=settings.s3_bucket, Key=failed_key)
+        return RetryResult(success=True, moved_from=failed_key, moved_to=new_key)
+    except ClientError as e:
+        err = e.response.get("Error", {})
+        return RetryResult(
+            success=False,
+            error=f"{err.get('Code', '?')}: {err.get('Message', str(e))}",
+        )
+    except Exception as e:
+        return RetryResult(success=False, error=str(e))
+
+
+async def retry_dlq_item(failed_key: str) -> RetryResult:
+    """
+    Przerzuć plik z inbox-failed/<date>/<file> z powrotem do inbox/retry-<ts>-<file>.
+    Worker (mode=hos) podniesie w max 30s i spróbuje przetworzyć ponownie.
+
+    Idempotent: jeśli source juz nie istnieje, zwraca błąd "Source not found".
+    """
+    if not settings.s3_access_key_id or not settings.s3_endpoint:
+        return RetryResult(success=False, error="S3 not configured")
+    if not failed_key.startswith("inbox-failed/"):
+        return RetryResult(
+            success=False,
+            error="Key musi zaczynać się od 'inbox-failed/' (sanity check)",
+        )
+    return await asyncio.to_thread(_retry_sync, failed_key)
+
+
+async def retry_all_dlq(date_filter: Optional[str] = None, max_items: int = 50) -> dict[str, Any]:
+    """
+    Bulk retry — przerzuć wszystkie failed items (opcjonalnie tylko z konkretnej daty).
+
+    Args:
+        date_filter: YYYY-MM-DD, lub None dla wszystkich
+        max_items: cap żeby nie spamić workera tysiącami plików
+
+    Returns:
+        dict z 'moved', 'errors', 'list'.
+    """
+    listed = await list_dlq_items(limit=max_items)
+    if listed["status"] != "ok":
+        return {"moved": 0, "errors": 0, "message": listed.get("message", "?")}
+
+    moved = 0
+    errors = 0
+    items_log: list[str] = []
+    for it in listed["items"]:
+        if date_filter and it.date != date_filter:
+            continue
+        result = await retry_dlq_item(it.key)
+        if result.success:
+            moved += 1
+            items_log.append(f"OK {it.filename}")
+        else:
+            errors += 1
+            items_log.append(f"FAIL {it.filename}: {result.error}")
+
+    return {
+        "moved": moved,
+        "errors": errors,
+        "filter": date_filter or "all",
+        "log": items_log,
+    }

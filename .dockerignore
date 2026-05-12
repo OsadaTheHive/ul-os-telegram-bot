@@ -1,0 +1,60 @@
+# Sekrety - NIGDY do obrazu
+.env
+.env.*
+*.env.backup-*
+
+# Logs (volume mount w Coolify)
+logs/
+*.log
+
+# Python local cache
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# IDE/editor
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+.DS_Store
+
+# Git
+.git/
+.gitignore
+
+# Docs (nie potrzebne w runtime)
+docs/
+*.md
+!app/templates/README.md
+
+# Test artifacts
+tests/__pycache__/
+
+# Coolify configs (jeśli kiedyś dojdą)
+.coolify/
+
+# Backups (lokalne, kropki w nazwie)
+*.tar.gz
+*backup*
+
+# OS junk
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Python build artifacts
+build/
+dist/
+*.egg-info/
+
+# Editor settings
+.editorconfig
