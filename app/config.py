@@ -53,9 +53,25 @@ class Settings(BaseSettings):
     s3_region: str = Field(default="nbg1")
     # Prefix do ktorego bot uploaduje pliki. Worker (mode=hos) polluje ten sam prefix.
     s3_inbox_prefix: str = Field(default="inbox/")
+    # Prefix dla wygenerowanych dokumentow (DOCX/PDF z /generate)
+    s3_generated_prefix: str = Field(default="generated/")
 
     # Tenant (per ADR-008)
     tenant_id: str = Field(default="hivelive_ecosystem")
+
+    # === External AI services (Sprint 1.7-1.9) ===
+    # Perplexity Sonar Deep Research (https://docs.perplexity.ai)
+    perplexity_api_key: str = Field(default="")
+    perplexity_model: str = Field(default="sonar-deep-research")
+    # Anthropic (Conversational /ask z dostepem do MCP tools)
+    anthropic_api_key: str = Field(default="")
+    anthropic_model: str = Field(default="claude-haiku-4-5")
+    # OpenAI Whisper (voice transcription)
+    openai_api_key: str = Field(default="")
+    openai_whisper_model: str = Field(default="whisper-1")
+
+    # Notifier thresholds
+    notifier_interval_seconds: int = Field(default=14400)  # 4h
 
 
 # Singleton dla całej aplikacji

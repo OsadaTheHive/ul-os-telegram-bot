@@ -809,3 +809,317 @@ async def handle_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = msg[:3500] + "\n... (truncated)"
 
     await update.message.reply_text(msg)
+
+
+# ============================================================
+# /status - agregat: bot + Directus + MCP + DLQ + queue + Vault
+# Sprint 1.6 (ADR Hubert)
+# ============================================================
+
+async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Composite status - zlozenie /health + /breakers + DLQ count + queue count."""
+    from .breaker import breakers
+    import time
+
+    lines = ["📊 UL OS — status zbiorczy"]
+    lines.append("")
+
+    # 1. Bot uptime
+    if context.application.bot_data.get("started_at"):
+        up = int(time.time() - context.application.bot_data["started_at"])
+        hrs = up // 3600
+        mins = (up % 3600) // 60
+        lines.append(f"🤖 Bot: up {hrs}h {mins}m, whitelist={len(settings.admin_user_ids)}")
+    else:
+        lines.append(f"🤖 Bot: aktywny, whitelist={len(settings.admin_user_ids)}")
+
+    # 2. Circuit breakers
+    breaker_summary = []
+    for name, br in breakers.items():
+        state = br.get_state().state.value
+        emoji = "🟢" if state == "closed" else ("🟡" if state == "half_open" else "🔴")
+        breaker_summary.append(f"{emoji}{name}")
+    lines.append("⚡ Breakers: " + " ".join(breaker_summary))
+
+    # 3. Directus quick check
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{settings.directus_url}/server/health")
+            if r.status_code == 200:
+                lines.append("🗄️  Directus: OK")
+            else:
+                lines.append(f"🗄️  Directus: HTTP {r.status_code}")
+    except Exception as e:
+        lines.append(f"🗄️  Directus: ⚠ {str(e)[:40]}")
+
+    # 4. MCP server quick check
+    if settings.mcp_base_url and settings.mcp_bearer_token:
+        try:
+            from .services.mcp_client import mcp_status
+            mcp_info = await mcp_status()
+            if mcp_info.get("ok"):
+                lines.append(f"🧠 MCP: OK ({mcp_info.get('tools_count', '?')} tools)")
+            else:
+                lines.append(f"🧠 MCP: ⚠ {mcp_info.get('error', '?')[:40]}")
+        except Exception as e:
+            lines.append(f"🧠 MCP: ⚠ {str(e)[:40]}")
+
+    # 5. HOS queue + DLQ counts
+    if settings.s3_endpoint and settings.s3_access_key_id:
+        try:
+            from .services.notifier import _count_objects_sync
+            import asyncio as _asyncio
+            inbox = await _asyncio.to_thread(_count_objects_sync, "inbox/")
+            failed = await _asyncio.to_thread(_count_objects_sync, "inbox-failed/")
+            processed_today_prefix = f"inbox-processed/{__import__('datetime').date.today().isoformat()}/"
+            processed = await _asyncio.to_thread(_count_objects_sync, processed_today_prefix)
+            lines.append(
+                f"📦 HOS: inbox={inbox} | processed today={processed} | DLQ={failed}"
+            )
+        except Exception as e:
+            lines.append(f"📦 HOS: ⚠ {str(e)[:40]}")
+
+    # 6. Vault HEAD (jezeli moglbym z MCP, na razie pomijam — robotem narzedzie)
+    # TODO: dodac vault_status z MCP gdy jest endpoint
+
+    # 7. Ostatni audit event (kto co kiedy)
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        audit_path = _Path("logs/audit.jsonl")
+        if audit_path.exists():
+            with open(audit_path, "rb") as f:
+                f.seek(0, 2)  # end
+                size = f.tell()
+                f.seek(max(0, size - 4096))  # ostatnie ~4KB
+                tail = f.read().decode("utf-8", errors="ignore")
+                last_lines = [l for l in tail.split("\n") if l.strip()][-1:]
+                if last_lines:
+                    try:
+                        e = _json.loads(last_lines[-1])
+                        ts = e.get("iso", "?")[11:16]
+                        lines.append(
+                            f"📝 Last audit: {ts} @{e.get('username','?')} /{e.get('action','?')}={e.get('result','?')}"
+                        )
+                    except _json.JSONDecodeError:
+                        pass
+    except Exception:
+        pass
+
+    lines.append("")
+    lines.append("📚 Więcej: /health /breakers /dlq /audit /koszty /ulos_status")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+# ============================================================
+# /alerts - manualny check proactive notifier
+# Sprint 1.11 manual check
+# ============================================================
+
+async def handle_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manualnie sprawdz wszystkie alerty (DLQ, queue, _NEEDS_REVIEW, deadlines)."""
+    from .services import notifier
+    results = await notifier.manual_run()
+
+    lines = ["🔔 Alerts — manual check"]
+    lines.append("")
+    lines.append(f"🪦 DLQ: {results['dlq']}")
+    lines.append("")
+    lines.append(f"⏳ Queue: {results['queue']}")
+    lines.append("")
+    lines.append(f"📋 _NEEDS_REVIEW: {results['needs_review']}")
+    lines.append("")
+
+    deadlines = results.get("deadlines", [])
+    if deadlines and deadlines != ["OK"]:
+        lines.append(f"⏰ Deadlines:")
+        for d in deadlines:
+            lines.append(f"  {d}")
+    else:
+        lines.append("⏰ Deadlines: OK (brak deadlinow <7 dni)")
+
+    msg = "\n".join(lines)
+    if len(msg) > 3900:
+        msg = msg[:3900] + "\n…(obciete)"
+    await update.message.reply_text(msg)
+
+
+# ============================================================
+# /generate <vault-path-or-slug> - DOCX z Vault markdown
+# Sprint 1.10
+# ============================================================
+
+async def handle_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Generuje DOCX z markdown w Vault.
+
+    Użycie: /generate <vault-path>
+    np.: /generate 50 — BIDBEE/_INBOX/2026-05-11_brief-bike-box-v6.md
+    np.: /generate brief-bike-box-v6  (auto-search w Vault przez MCP)
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "Uzycie: /generate <vault-path-or-slug>\n\n"
+            "Przyklad:\n"
+            "  /generate 50 — BIDBEE/_INBOX/2026-05-11_brief-bike-box-v6.md\n"
+            "  /generate brief-bike-box-v6 (auto-search)"
+        )
+        return
+
+    from .services import generator
+    query = " ".join(context.args).strip()
+
+    progress = await update.message.reply_text(f"📄 Generuje DOCX dla: {query}\nProszę poczekać...")
+
+    try:
+        result = await generator.generate_docx_from_vault(query)
+        if result.success:
+            await progress.edit_text(
+                f"✅ DOCX wygenerowany!\n\n"
+                f"Plik: {result.filename}\n"
+                f"Rozmiar: {result.size_bytes / 1024:.1f} KB\n"
+                f"Vault source: {result.source_vault_path}\n\n"
+                f"📥 Pobierz: {result.download_url}"
+            )
+        else:
+            await progress.edit_text(
+                f"❌ Generowanie nie powiodlo sie\n"
+                f"Blad: {result.error}"
+            )
+    except Exception as e:
+        log.exception("generate failed")
+        await progress.edit_text(f"❌ Blad generatora: {e}")
+
+
+# ============================================================
+# /research <prompt> - Perplexity Deep Research → Vault
+# Sprint 1.7
+# ============================================================
+
+async def handle_research(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Wysyla prompt do Perplexity Sonar Deep Research, zapisuje wynik do HOS inbox/
+    -> worker przerobi i wpisze do Directus + Vault.
+
+    Uzycie: /research <prompt>
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "Uzycie: /research <prompt>\n\n"
+            "Przyklady:\n"
+            "  /research stan rynku BESS w Polsce 2026\n"
+            "  /research konkurenci BEEzzy 250kWh BESS"
+        )
+        return
+
+    if not settings.perplexity_api_key:
+        await update.message.reply_text(
+            "⚠️ Perplexity API key nie skonfigurowany.\n\n"
+            "Aby aktywować Sprint 1.7 Research Bot:\n"
+            "1. Załóż konto na https://perplexity.ai/settings/api ($5-20/mies)\n"
+            "2. Skopiuj API key\n"
+            "3. Wpisz do .env: PERPLEXITY_API_KEY=pplx-...\n"
+            "4. Restart bota: launchctl unload+load com.ulos.telegram-bot.plist"
+        )
+        return
+
+    from .services import perplexity
+    prompt = " ".join(context.args).strip()
+
+    progress = await update.message.reply_text(
+        f"🔍 Perplexity Deep Research:\n  {prompt[:120]}{'...' if len(prompt)>120 else ''}\n\n"
+        "Proszę czekać (zwykle 30-60s)..."
+    )
+
+    try:
+        result = await perplexity.research(prompt)
+        if result.success:
+            user = update.effective_user
+            uploaded = await perplexity.upload_to_inbox(
+                result.markdown,
+                prompt=prompt,
+                telegram_user_id=user.id if user else 0,
+                telegram_username=user.username if user else None,
+            )
+            await progress.edit_text(
+                f"✅ Analiza gotowa!\n\n"
+                f"📋 Prompt: {prompt[:100]}{'...' if len(prompt)>100 else ''}\n"
+                f"📊 Tokens: {result.input_tokens} in / {result.output_tokens} out\n"
+                f"💰 Cost: ~${result.cost_usd:.4f}\n"
+                f"📚 Citations: {len(result.citations)}\n\n"
+                f"🗂️ HOS: {uploaded.s3_key}\n"
+                f"⏱️ Worker przetworzy w ~30s i wpisze do Directus + Vault"
+            )
+        else:
+            await progress.edit_text(f"❌ Research fail: {result.error}")
+    except Exception as e:
+        log.exception("research failed")
+        await progress.edit_text(f"❌ Blad: {e}")
+
+
+# ============================================================
+# /ask <pytanie> - Conversational Claude z dostepem do Vault
+# Sprint 1.9
+# ============================================================
+
+async def handle_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Pytanie do Claude z dostepem do Vault (przez MCP tools).
+    Multi-turn: zapamietuje kontekst per user.
+
+    Uzycie: /ask <pytanie>
+           /ask reset  (czyszczenie kontekstu)
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "Uzycie: /ask <pytanie>\n"
+            "       /ask reset (czysci historie rozmowy)\n\n"
+            "Claude ma dostep do Vault (vault_search, vault_read) i Directus."
+        )
+        return
+
+    if not settings.anthropic_api_key:
+        await update.message.reply_text(
+            "⚠️ Anthropic API key nie skonfigurowany.\n\n"
+            "Aby aktywować Sprint 1.9 Conversational Claude:\n"
+            "1. Załóż konto na https://console.anthropic.com\n"
+            "2. Utwórz API key\n"
+            "3. Wpisz do .env: ANTHROPIC_API_KEY=sk-ant-...\n"
+            "4. Restart bota"
+        )
+        return
+
+    from .services import conversational
+    user = update.effective_user
+    user_id = user.id if user else 0
+    prompt = " ".join(context.args).strip()
+
+    if prompt.lower() == "reset":
+        conversational.reset_context(user_id)
+        await update.message.reply_text("🔄 Kontekst rozmowy wyczyszczony.")
+        return
+
+    progress = await update.message.reply_text("🧠 Claude myśli...")
+
+    try:
+        response = await conversational.ask(user_id, prompt)
+        if response.success:
+            full = response.text
+            if response.tool_calls:
+                full += f"\n\n🔧 Tools użyte: {', '.join(response.tool_calls)}"
+            full += f"\n\n💰 ~${response.cost_usd:.4f} ({response.input_tokens}+{response.output_tokens} tok)"
+
+            if len(full) > 3900:
+                # Telegram split na multiple messages
+                await progress.edit_text(full[:3900] + "\n…(1/2)")
+                for chunk_start in range(3900, len(full), 3900):
+                    chunk = full[chunk_start:chunk_start + 3900]
+                    await update.message.reply_text(chunk)
+            else:
+                await progress.edit_text(full)
+        else:
+            await progress.edit_text(f"❌ Claude error: {response.error}")
+    except Exception as e:
+        log.exception("ask failed")
+        await progress.edit_text(f"❌ Blad: {e}")

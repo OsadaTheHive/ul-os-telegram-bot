@@ -35,11 +35,14 @@ from . import audit, breaker, health_endpoint, monitor
 from .config import settings
 from .limiter import check as rate_check
 from .handlers import (
+    handle_alerts,
+    handle_ask,
     handle_audit,
     handle_breakers,
     handle_digest,
     handle_dlq,
     handle_document,
+    handle_generate,
     handle_help,
     handle_health,
     handle_koszty,
@@ -48,6 +51,8 @@ from .handlers import (
     handle_mcp_szukaj,
     handle_mcp_tools,
     handle_ostatnie,
+    handle_research,
+    handle_status,
     handle_photo,
     handle_produkt,
     handle_start,
@@ -245,6 +250,38 @@ async def cmd_mcp_tools(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_mcp_tools(update, context)
 
 
+# === Sprint 1.6 / 1.7 / 1.9 / 1.10 / 1.11 ===
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorized_or_ignore(update, context):
+        return
+    await handle_status(update, context)
+
+
+async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorized_or_ignore(update, context):
+        return
+    await handle_alerts(update, context)
+
+
+async def cmd_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorized_or_ignore(update, context):
+        return
+    await handle_generate(update, context)
+
+
+async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorized_or_ignore(update, context):
+        return
+    await handle_research(update, context)
+
+
+async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorized_or_ignore(update, context):
+        return
+    await handle_ask(update, context)
+
+
 async def msg_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorized_or_ignore(update, context):
         return
@@ -283,6 +320,11 @@ async def post_init(app: Application):
             BotCommand("breakers", "Status circuit breakers (Directus/MCP/Anthropic)"),
             BotCommand("limits", "Twoje rate limits per komenda"),
             BotCommand("mcp_tools", "Lista 5 tools wystawionych przez MCP"),
+            BotCommand("status", "Agregat statusu UL OS (bot/Directus/MCP/HOS/breakers)"),
+            BotCommand("alerts", "Manualnie sprawdz alerty (DLQ/queue/review/deadlines)"),
+            BotCommand("generate", "/generate <vault-path> → DOCX z Vault + papier firmowy"),
+            BotCommand("research", "/research <prompt> → Perplexity Deep Research → Vault"),
+            BotCommand("ask", "/ask <pytanie> → Claude z dostępem do Vault (multi-turn)"),
         ]
     )
     log.info(
@@ -315,6 +357,17 @@ async def post_init(app: Application):
         )
         log.info("Daily digest scheduled (09:00 UTC daily)")
 
+        # Sprint 1.11 — Proactive notifications co N sek (default 4h = 14400s)
+        from .services import notifier as _notifier
+        _notif_interval = settings.notifier_interval_seconds
+        app.job_queue.run_repeating(
+            _notifier.tick,
+            interval=_notif_interval,
+            first=120,  # 2 min po starcie żeby pierwszy scan się wykonał
+            name="proactive_notifier",
+        )
+        log.info(f"Proactive notifier scheduled (interval={_notif_interval}s = {_notif_interval/3600:.1f}h)")
+
     # HTTP health endpoint na port 8080 (dla zewnetrznego uptime monitora)
     try:
         await health_endpoint.start_health_server(port=8080)
@@ -346,6 +399,13 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("breakers", cmd_breakers))
     app.add_handler(CommandHandler("limits", cmd_limits))
     app.add_handler(CommandHandler("mcp_tools", cmd_mcp_tools))
+
+    # Sprint 1.6 / 1.7 / 1.9 / 1.10 / 1.11
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("alerts", cmd_alerts))
+    app.add_handler(CommandHandler("generate", cmd_generate))
+    app.add_handler(CommandHandler("research", cmd_research))
+    app.add_handler(CommandHandler("ask", cmd_ask))
 
     app.add_handler(MessageHandler(filters.Document.ALL, msg_document))
     app.add_handler(MessageHandler(filters.PHOTO, msg_photo))
