@@ -625,20 +625,58 @@ async def handle_koszty(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 async def handle_dlq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lista failed items czekajacych na review/retry."""
+    """
+    Lista failed items w HOS DLQ (inbox-failed/).
+
+    Worker UL OS (mode=hos) zapisuje failed plik z S3 metadata x-worker-error.
+    Tutaj pokazujemy ostatnie N rekordow z error message + filename + size + data.
+
+    Opcjonalny arg: /dlq 20 = pokaz top 20 (default 10, max 50).
+    """
     from .services import dlq
 
-    result = await dlq.list_dlq_items(limit=10)
+    limit = 10
+    if context.args:
+        try:
+            limit = max(1, min(int(context.args[0]), 50))
+        except ValueError:
+            pass
 
-    msg = "Dead Letter Queue (failed ingests)\n\n"
-    msg += f"Status: {result['status']}\n\n"
-    msg += result.get("message", "")
+    result = await dlq.list_dlq_items(limit=limit)
 
-    if result["total"] > 0:
-        msg += f"\n\nItems ({result['total']}):\n"
-        for item in result["items"][:10]:
-            msg += f"  • {item.get('hash', '?')[:12]}... - {item.get('error', '?')}\n"
+    status = result["status"]
+    if status == "not_configured":
+        await update.message.reply_text(f"⚠️ {result.get('message','DLQ not configured')}")
+        return
+    if status == "error":
+        await update.message.reply_text(f"❌ {result.get('message','DLQ error')}")
+        return
+    if status == "empty":
+        await update.message.reply_text(f"✅ {result.get('message','DLQ pusty')}")
+        return
 
+    items = result["items"]
+    total = result["total"]
+    lines = [
+        f"🪦 Dead Letter Queue ({total} items, pokaz top {len(items)}):",
+        "",
+    ]
+
+    for it in items:
+        # it to dataclass DLQItem
+        size_mb = it.size / 1024 / 1024
+        ts = it.last_modified.strftime("%Y-%m-%d %H:%M") if it.last_modified else "?"
+        err = (it.error_message or "(brak metadata x-worker-error)")[:120]
+        lines.append(
+            f"• [{ts}] {it.filename}\n"
+            f"  rozm: {size_mb:.2f} MB · dir: inbox-failed/{it.date}/\n"
+            f"  err: {err}\n"
+        )
+
+    msg = "\n".join(lines)
+    # Telegram limit 4096 chars na message
+    if len(msg) > 3900:
+        msg = msg[:3900] + "\n…(obciete)"
     await update.message.reply_text(msg)
 
 

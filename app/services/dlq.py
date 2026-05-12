@@ -1,60 +1,168 @@
 """
-Dead Letter Queue check - placeholder do czasu Worker DLQ implementation.
+Dead Letter Queue listing - realne boto3 listing dla s3://ul-os-storage/inbox-failed/.
 
-Plan (per FILAR 1 S-2 z planu autonomii):
-  HOS bucket struktura:
-    ul-os-storage/incoming/   ← Worker zassawia
-    ul-os-storage/processed/  ← sukces
-    ul-os-storage/dlq/        ← failed po 3 retry
-    ul-os-storage/dlq/<date>/<hash>.error.json  ← manifest
+Worker UL OS (mode=hos, src/hos-poller.ts po Sprint 1 2026-05-11) wpisuje:
+  s3://ul-os-storage/inbox-failed/<YYYY-MM-DD>/<filename>
+z S3 metadata:
+  x-worker-error: <error message, max 200 chars>
 
-Aktualnie:
-- Worker NIE wdrozony w Coolify
-- HOS bucket utworzony ale niewykorzystany
-- DLQ struktura nie istnieje
-
-Bot komenda /dlq:
-- jezeli ENV S3_ACCESS_KEY_ID jest ustawiony -> sprawdz bucket dlq/
-- jezeli nie -> powiedz ze placeholder, czeka na Worker deploy
+Bot komenda /dlq pokazuje ostatnie N items z dat + error_message + size + LastModified.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
-from ..config import settings
+import boto3
+from botocore.client import Config as BotoConfig
+from botocore.exceptions import ClientError
+
+from app.config import settings
 
 log = logging.getLogger(__name__)
 
 
+@dataclass
+class DLQItem:
+    key: str
+    filename: str
+    date: str  # YYYY-MM-DD z prefix
+    size: int
+    last_modified: datetime | None
+    error_message: str | None
+
+
+def _build_client():
+    return boto3.client(
+        "s3",
+        endpoint_url=settings.s3_endpoint,
+        aws_access_key_id=settings.s3_access_key_id,
+        aws_secret_access_key=settings.s3_secret_access_key,
+        region_name=settings.s3_region,
+        config=BotoConfig(
+            s3={"addressing_style": "path"},
+            signature_version="s3v4",
+            retries={"max_attempts": 3, "mode": "adaptive"},
+        ),
+    )
+
+
+def _list_failed_sync(limit: int) -> tuple[list[DLQItem], int]:
+    """Synchroniczny listing inbox-failed/ + pobieranie metadata per obiekt."""
+    client = _build_client()
+    failed_prefix = "inbox-failed/"
+
+    # List wszystkie pod inbox-failed/
+    resp = client.list_objects_v2(
+        Bucket=settings.s3_bucket,
+        Prefix=failed_prefix,
+        MaxKeys=200,  # bierzemy nadwyżkę żeby posortować i pokazać top N
+    )
+    contents = resp.get("Contents", []) or []
+    # Wyklucz .gitkeep i "/" placeholdery
+    real = [
+        o for o in contents
+        if o.get("Key", "")
+        and not o["Key"].endswith("/")
+        and not o["Key"].endswith("/.gitkeep")
+    ]
+    total = len(real)
+
+    # Posortuj malejąco po LastModified (najnowsze najpierw)
+    real.sort(key=lambda o: o.get("LastModified") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    top = real[:limit]
+
+    # Dla każdego pobierz metadata (head_object) żeby wyciągnąć x-worker-error
+    items: list[DLQItem] = []
+    for obj in top:
+        key = obj["Key"]
+        # Wyciągnij datę z klucza inbox-failed/<YYYY-MM-DD>/<filename>
+        parts = key[len(failed_prefix):].split("/", 1)
+        date_part = parts[0] if len(parts) == 2 else "?"
+        filename = parts[1] if len(parts) == 2 else key.split("/")[-1]
+
+        error_msg = None
+        try:
+            head = client.head_object(Bucket=settings.s3_bucket, Key=key)
+            # boto3 lowercase'uje user metadata keys
+            metadata = head.get("Metadata", {}) or {}
+            error_msg = metadata.get("x-worker-error") or metadata.get("worker-error")
+        except ClientError as e:
+            log.warning("head_object failed for %s: %s", key, e)
+
+        items.append(
+            DLQItem(
+                key=key,
+                filename=filename,
+                date=date_part,
+                size=obj.get("Size", 0) or 0,
+                last_modified=obj.get("LastModified"),
+                error_message=error_msg,
+            )
+        )
+
+    return items, total
+
+
 async def list_dlq_items(limit: int = 10) -> dict[str, Any]:
-    """List failed items in DLQ.
+    """
+    List failed items w DLQ (inbox-failed/).
+
+    Args:
+        limit: ile elementow zwrocic (default 10, max 50)
 
     Returns:
-        dict z 'status', 'items' (list), 'total', albo 'error'.
+        dict z 'status', 'items' (list[DLQItem]), 'total', 'message'.
     """
-    if not settings.s3_access_key_id:
+    if not settings.s3_access_key_id or not settings.s3_endpoint:
         return {
             "status": "not_configured",
             "message": (
-                "DLQ wymaga skonfigurowanego Hetzner Object Storage.\n"
-                "Worker DLQ jest planowany w Sprint 1 (Tier 0) - po wdrozeniu "
-                "Workera w Coolify (osobny project ul-os per ADR-002)."
+                "DLQ wymaga skonfigurowanego HOS.\n"
+                "Ustaw S3_ENDPOINT, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY w .env."
             ),
             "items": [],
             "total": 0,
         }
 
-    # TODO: gdy S3 keys sa - uzyj boto3/aiobotocore do listy s3://ul-os-storage/dlq/
-    # Aktualnie placeholder - bedzie aktywne po Worker deploy.
+    limit = max(1, min(limit, 50))
+
+    try:
+        items, total = await asyncio.to_thread(_list_failed_sync, limit)
+    except ClientError as e:
+        err = e.response.get("Error", {})
+        msg = f"{err.get('Code', '?')}: {err.get('Message', str(e))}"
+        log.error("DLQ list_objects_v2 ClientError: %s", msg)
+        return {
+            "status": "error",
+            "message": f"S3 error: {msg}",
+            "items": [],
+            "total": 0,
+        }
+    except Exception as e:
+        log.exception("DLQ unexpected error")
+        return {
+            "status": "error",
+            "message": f"Blad: {e}",
+            "items": [],
+            "total": 0,
+        }
+
+    if total == 0:
+        return {
+            "status": "empty",
+            "message": "DLQ pusty - wszystko OK, Worker nie zwracal failed ingestow.",
+            "items": [],
+            "total": 0,
+        }
+
     return {
-        "status": "configured_no_data",
-        "message": (
-            "S3 keys skonfigurowane, ale Worker DLQ jeszcze nie pisze do bucket.\n"
-            "Po wdrozeniu Workera w Coolify - failed ingests trafiaja do "
-            f"s3://{settings.s3_bucket}/dlq/<date>/<hash>.error.json."
-        ),
-        "items": [],
-        "total": 0,
+        "status": "ok",
+        "message": f"DLQ ma {total} failed item(s). Pokazuje top {len(items)}.",
+        "items": items,
+        "total": total,
     }
