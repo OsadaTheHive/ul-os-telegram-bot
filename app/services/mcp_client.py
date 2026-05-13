@@ -210,3 +210,20 @@ def extract_text_content(result: dict) -> str:
         if isinstance(block, dict) and block.get("type") == "text":
             texts.append(block.get("text", ""))
     return "\n".join(texts)
+
+
+async def mcp_status() -> dict:
+    """High-level health check dla /status agregatu.
+
+    Returns:
+        {"ok": True, "tools_count": N} jezeli MCP server odpowiada,
+        {"ok": False, "error": "..."} w przeciwnym razie.
+    """
+    client = get_client()
+    if client is None:
+        return {"ok": False, "error": "MCP client not configured"}
+    try:
+        tools = await client.list_tools()
+        return {"ok": True, "tools_count": len(tools)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
