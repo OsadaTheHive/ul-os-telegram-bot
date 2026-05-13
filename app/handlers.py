@@ -954,7 +954,7 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 2. Circuit breakers
     breaker_summary = []
     for name, br in breakers.items():
-        state = br.get_state().state.value
+        state = br.state.value
         emoji = "🟢" if state == "closed" else ("🟡" if state == "half_open" else "🔴")
         breaker_summary.append(f"{emoji}{name}")
     lines.append("⚡ Breakers: " + " ".join(breaker_summary))
