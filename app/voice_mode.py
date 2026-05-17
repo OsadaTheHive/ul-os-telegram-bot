@@ -17,9 +17,10 @@ API:
 
 from __future__ import annotations
 
+import io
 import logging
 
-from telegram import Update
+from telegram import InputFile, Update
 
 from .config import settings
 
@@ -62,15 +63,32 @@ async def maybe_send_tts(update: Update, text: str) -> bool:
     # Lazy import zeby nie ladowac httpx jesli TTS nieaktywne
     from .services.tts import synthesize
 
+    log.info("voice_mode: TTS dispatch start chat_id=%s text_len=%d", chat.id, len(text))
+
     try:
         audio = await synthesize(text)
         if audio is None:
-            log.debug("maybe_send_tts: synthesize returned None (no key or HTTP fail)")
+            log.warning(
+                "voice_mode: synthesize returned None (no key or HTTP fail) chat_id=%s",
+                chat.id,
+            )
             return False
 
-        await update.message.reply_voice(voice=audio)
-        log.info("voice_mode: TTS sent to chat_id=%s, %d bytes", chat.id, len(audio))
+        # ElevenLabs zwraca MP3 (mp3_44100_128). Telegram sendVoice wymaga OGG Opus —
+        # MP3 nie przejdzie. Uzywamy sendAudio (reply_audio) ktora akceptuje MP3.
+        # Trade-off: w Telegramie pojawia sie jako audio attachment z play button,
+        # nie jako "voice message" UX (waveform). Audio funkcjonalnie dziala.
+        bio = io.BytesIO(audio)
+        bio.name = "reply.mp3"
+        input_file = InputFile(bio, filename="reply.mp3")
+
+        await update.message.reply_audio(
+            audio=input_file,
+            title="UL OS reply",
+            performer="ElevenLabs TTS",
+        )
+        log.info("voice_mode: TTS sent OK chat_id=%s bytes=%d", chat.id, len(audio))
         return True
     except Exception:
-        log.exception("voice_mode: send_voice failed")
+        log.exception("voice_mode: reply_audio failed chat_id=%s", chat.id)
         return False
