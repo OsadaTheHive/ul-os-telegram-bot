@@ -93,13 +93,21 @@ def _make_progress_cb(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_
 
 
 async def _send_final(update: Update, text: str) -> None:
-    """Send final result (split if > Telegram limit)."""
+    """Send final result (split if > Telegram limit). Jesli voice_on, dodaj TTS audio."""
     if not update.message:
         return
     chunks = [text[i:i + 3900] for i in range(0, len(text), 3900)] or [""]
     for i, ch in enumerate(chunks):
         prefix = "" if len(chunks) == 1 else f"({i + 1}/{len(chunks)})\n"
         await update.message.reply_text(prefix + ch)
+
+    # Voice mode (Sprint TTS-minimal): jesli on, syntetyzuj caly text przez ElevenLabs
+    # i wyslij jako voice. Non-blocking — failure tylko log, tekstowa odpowiedz juz dotarla.
+    try:
+        from .voice_mode import maybe_send_tts
+        await maybe_send_tts(update, text)
+    except Exception:
+        log.exception("_send_final: TTS dispatch failed (non-blocking)")
 
 
 # ─── /claude main entry ────────────────────────────────────────────────────────

@@ -72,6 +72,11 @@ from .handlers_claude import (
     handle_yes,
     notify_restart_resume,
 )
+from .handlers_voice import (
+    handle_voice_off,
+    handle_voice_on,
+    handle_voice_status,
+)
 from .limiter import check as rate_check
 
 # Setup logging (text format dla dev / JSON dla produkcji - LOG_FORMAT=json env)
@@ -339,6 +344,24 @@ async def cmd_upload_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_upload_stats(update, context)
 
 
+async def cmd_voice_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorized_or_ignore(update, context):
+        return
+    await handle_voice_on(update, context)
+
+
+async def cmd_voice_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorized_or_ignore(update, context):
+        return
+    await handle_voice_off(update, context)
+
+
+async def cmd_voice_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorized_or_ignore(update, context):
+        return
+    await handle_voice_status(update, context)
+
+
 async def msg_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorized_or_ignore(update, context):
         return
@@ -406,6 +429,9 @@ async def post_init(app: Application):
             BotCommand("yes", "Zaakceptuj oczekującą akcję agenta"),
             BotCommand("no", "/no [powód] → odrzuć akcję agenta"),
             BotCommand("edit", "/edit <nowa instrukcja> → anuluj akcję, zlec inne"),
+            BotCommand("voice_on", "🔊 Włącz TTS (ElevenLabs) dla odpowiedzi /claude"),
+            BotCommand("voice_off", "🔇 Wyłącz TTS"),
+            BotCommand("voice_status", "Stan voice mode + dostępność klucza"),
         ]
     )
     log.info(
@@ -507,6 +533,11 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("yes", cmd_yes))
     app.add_handler(CommandHandler("no", cmd_no))
     app.add_handler(CommandHandler("edit", cmd_edit))
+
+    # TTS voice mode (Sprint TTS-minimal)
+    app.add_handler(CommandHandler("voice_on", cmd_voice_on))
+    app.add_handler(CommandHandler("voice_off", cmd_voice_off))
+    app.add_handler(CommandHandler("voice_status", cmd_voice_status))
 
     app.add_handler(MessageHandler(filters.Document.ALL, msg_document))
     app.add_handler(MessageHandler(filters.PHOTO, msg_photo))
