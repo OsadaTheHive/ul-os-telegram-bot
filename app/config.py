@@ -79,6 +79,11 @@ class Settings(BaseSettings):
     openai_api_key: str = Field(default="")
     openai_whisper_model: str = Field(default="whisper-1")
 
+    # === TTS — ElevenLabs (Sprint TTS-minimal) ===
+    # Klucz API ElevenLabs. Jesli pusty, /voice_on nie wysleje audio.
+    # Nazwa env var: ELEVENLABS_API_KEY
+    elevenlabs_api_key: str = Field(default="")
+
     # Notifier thresholds
     notifier_interval_seconds: int = Field(default=14400)  # 4h
 
