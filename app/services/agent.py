@@ -49,7 +49,7 @@ ANTHROPIC_VERSION = "2023-06-01"
 _PRICING = {
     "claude-haiku-4-5": (1.0, 5.0),
     "claude-sonnet-4-5": (3.0, 15.0),
-    "claude-sonnet-4-20250514": (3.0, 15.0),
+    "claude-sonnet-4-6-20250929": (3.0, 15.0),
     "claude-opus-4-5": (15.0, 75.0),
 }
 
@@ -199,23 +199,65 @@ async def _anthropic_call(
 
 # ─── Tool dispatch via MCP ─────────────────────────────────────────────────────
 
+# Retry policy for transient MCP failures (5xx, connection error, timeout).
+# Hard errors (MCPError from server-side error response, 4xx) do NOT retry — they
+# usually indicate bad input which would just fail again.
+_MCP_RETRY_BACKOFF_S = (1.0, 3.0, 10.0)  # 3 attempts total: immediate, +1s, +3s, +10s
+
+
+def _is_transient_http_error(exc: BaseException) -> bool:
+    """Returns True if the exception is worth retrying."""
+    if isinstance(exc, (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError) and 500 <= exc.response.status_code < 600:
+        return True
+    # MCPError may wrap upstream 5xx — heuristic on message
+    if isinstance(exc, MCPError):
+        msg = str(exc).lower()
+        if "500" in msg or "502" in msg or "503" in msg or "504" in msg or "timeout" in msg:
+            return True
+    return False
+
+
 async def _dispatch_mcp_tool(name: str, arguments: dict[str, Any]) -> str:
-    """Call MCP tool, return text content (JSON-ish) capped to ~4k chars."""
+    """
+    Call MCP tool with retry on transient errors. Returns text content (JSON-ish)
+    capped to ~8k chars.
+
+    Retry policy: up to 3 attempts on 5xx / connection / timeout errors with
+    backoff 1s, 3s, 10s. Permanent errors (4xx, bad input) fail immediately.
+    """
     mcp = get_client()
     if mcp is None:
         return json.dumps({"error": "MCP client not configured"})
-    try:
-        result = await mcp.call_tool(name, arguments)
-        text = extract_text_content(result) or json.dumps(result, ensure_ascii=False, default=str)
-        # Anthropic context safety: cap each tool_result
-        return text[:8000]
-    except MCPError as e:
-        return json.dumps({"error": f"MCP error: {e}"})
-    except httpx.HTTPError as e:
-        return json.dumps({"error": f"HTTP error: {e}"})
-    except Exception as e:  # noqa: BLE001 - catch-all for tool dispatch safety
-        log.exception("MCP tool %s dispatch failed", name)
-        return json.dumps({"error": f"dispatch failed: {e}"})
+
+    last_exc: BaseException | None = None
+    for attempt, backoff in enumerate([0.0, *_MCP_RETRY_BACKOFF_S[:-1]]):
+        if backoff > 0:
+            log.info("MCP %s retry %d after %.1fs (last: %s)", name, attempt, backoff, last_exc)
+            await asyncio.sleep(backoff)
+        try:
+            result = await mcp.call_tool(name, arguments)
+            text = extract_text_content(result) or json.dumps(result, ensure_ascii=False, default=str)
+            return text[:8000]
+        except (MCPError, httpx.HTTPError) as e:
+            last_exc = e
+            if not _is_transient_http_error(e):
+                # Hard error — don't retry
+                if isinstance(e, MCPError):
+                    return json.dumps({"error": f"MCP error: {e}"})
+                return json.dumps({"error": f"HTTP error: {e}"})
+            # transient → loop continues
+        except Exception as e:  # noqa: BLE001 - catch-all for tool dispatch safety
+            log.exception("MCP tool %s dispatch failed (attempt %d, non-retriable)", name, attempt + 1)
+            return json.dumps({"error": f"dispatch failed: {e}"})
+
+    # All retries exhausted
+    log.warning("MCP %s exhausted retries (last: %s)", name, last_exc)
+    return json.dumps({
+        "error": f"MCP unavailable after {len(_MCP_RETRY_BACKOFF_S)} retries",
+        "last_error": str(last_exc)[:200] if last_exc else "?",
+    })
 
 
 def _emoji_for_tool(name: str) -> str:

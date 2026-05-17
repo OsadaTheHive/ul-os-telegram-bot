@@ -354,7 +354,20 @@ async def msg_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def msg_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorized_or_ignore(update, context):
         return
+    # If chat has an active /claude session, intercept voice → transcribe → continue.
+    # Returns True when handled — otherwise fall through to default Whisper → HOS upload.
+    from .handlers_claude import maybe_continue_via_voice
+    if await maybe_continue_via_voice(update, context):
+        return
     await handle_voice(update, context)
+
+
+async def msg_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Plain text (no command). Continues active /claude session if any; ignored otherwise."""
+    if not await authorized_or_ignore(update, context):
+        return
+    from .handlers_claude import maybe_continue_via_text
+    await maybe_continue_via_text(update, context)
 
 
 async def post_init(app: Application):
@@ -498,6 +511,8 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Document.ALL, msg_document))
     app.add_handler(MessageHandler(filters.PHOTO, msg_photo))
     app.add_handler(MessageHandler(filters.VOICE, msg_voice))
+    # Plain text without command — continues active /claude session when present.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_text))
 
     return app
 

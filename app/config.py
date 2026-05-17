@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str = Field(default="")
     anthropic_model: str = Field(default="claude-haiku-4-5")
     # Agent mode (/claude) — wezszy stack, pelne MCP tools, approval gates, streaming
-    anthropic_agent_model: str = Field(default="claude-sonnet-4-20250514")
+    anthropic_agent_model: str = Field(default="claude-sonnet-4-6-20250929")
     anthropic_agent_thinking_budget: int = Field(default=8000)
     anthropic_agent_max_tokens: int = Field(default=16000)
     anthropic_agent_max_iterations: int = Field(default=24)

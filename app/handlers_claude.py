@@ -496,3 +496,181 @@ async def notify_restart_resume(application) -> None:
             )
         except TelegramError as e:
             log.warning("restart resume notify failed chat=%s: %s", sess.chat_id, e)
+
+
+# ─── Continuation: plain text + voice (without explicit /claude prefix) ────────
+#
+# When a user has an active /claude session and sends a message WITHOUT the
+# /claude command prefix, we treat it as a continuation of that session. Voice
+# messages are transcribed via Whisper first.
+#
+# These helpers RETURN True when they handled the message, so the existing
+# msg_voice handler can fall through to its normal "Whisper → HOS upload" flow.
+
+async def _run_continuation(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    prompt: str,
+    *,
+    audit_action: str,
+    intro_emoji: str,
+    intro_label: str,
+) -> None:
+    """Shared engine for voice/text continuations — mirrors handle_claude body."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    user_id = user.id if user else 0
+    sess = agent_session.load_active(chat_id)
+    if sess is None or sess.status not in ("active", "paused"):
+        return  # nothing to continue (should have been guarded by caller)
+
+    if sess.status == "paused":
+        sess.status = "active"  # implicit resume on continuation
+
+    audit.write(
+        user_id=user_id, username=user.username if user else None,
+        action=audit_action, args=prompt[:200],
+        extra={"session_id": sess.id, "backend": agent_session.backend_label()},
+    )
+
+    progress = await update.message.reply_text(
+        f"{intro_emoji} {intro_label}\n🧠 Sesja `{sess.id[:8]}` — agent myśli..."
+    )
+    sess.last_progress_message_id = progress.message_id
+    progress_cb = _make_progress_cb(context, chat_id, progress.message_id)
+
+    try:
+        await agent.maybe_summarize(sess)
+    except Exception as e:  # noqa: BLE001
+        log.debug("maybe_summarize failed: %s", e)
+
+    try:
+        result = await agent.run_turn(session=sess, user_text=prompt, progress_cb=progress_cb)
+    except Exception as e:  # noqa: BLE001
+        log.exception("agent.run_turn crashed (continuation)")
+        sess.status = "error"
+        agent_session.save(sess)
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=progress.message_id,
+            text=f"❌ Agent crash: {e}",
+        )
+        return
+
+    agent_session.save(sess)
+    await _finalize_turn(update, context, chat_id, progress.message_id, sess, result)
+
+
+async def maybe_continue_via_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Called from msg_voice before the existing Whisper→HOS flow.
+
+    If chat has active/paused /claude session:
+      - transcribe voice via Whisper
+      - feed transcript to agent as next user turn
+      - return True (caller skips default voice handling)
+    If chat has awaiting_approval:
+      - hint user to use /yes /no /edit, return True (intercepted)
+    Otherwise:
+      - return False (caller does default voice → HOS classification)
+    """
+    if not _is_authorized(update):
+        return False
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    sess = agent_session.load_active(chat_id)
+    if sess is None:
+        return False
+
+    if sess.status == "awaiting_approval":
+        await update.message.reply_text(
+            "📌 Sesja `/claude` czeka na decyzję. Odpowiedz `/yes`, `/no [powód]` lub "
+            "`/edit <nowa instrukcja>` (voice nie zinterpretuję jako decyzję).",
+            parse_mode="Markdown",
+        )
+        return True
+
+    if sess.status not in ("active", "paused"):
+        return False
+
+    voice = update.message.voice
+    if not voice:
+        return False
+
+    status_msg = await update.message.reply_text(
+        f"🎙 Voice ({voice.duration or 0}s) → transkrypcja przez Whisper..."
+    )
+
+    # Lazy imports — exact same path as the existing handle_voice
+    from .services.whisper_local import transcribe
+
+    try:
+        tg_file = await update.message.get_bot().get_file(voice.file_id)
+        audio_bytes = bytes(await tg_file.download_as_bytearray())
+        tr = await transcribe(audio_bytes, source_extension=".ogg")
+    except Exception as e:  # noqa: BLE001
+        log.exception("voice continuation: transcribe failed")
+        await status_msg.edit_text(f"❌ Whisper fail: {e}")
+        return True
+
+    if not tr.success or not tr.text.strip():
+        await status_msg.edit_text(
+            f"⚠️ Whisper fail: {tr.error or 'pusta transkrypcja'}.\n"
+            "Voice NIE zostało wysłane do HOS (przerwana sesja /claude continuation)."
+        )
+        return True
+
+    transcript = tr.text.strip()
+    preview = transcript[:160] + ("…" if len(transcript) > 160 else "")
+    try:
+        await status_msg.edit_text(f"🎙 Transkrypcja: „{preview}\"")
+    except BadRequest:
+        pass
+
+    audit.write(
+        user_id=update.effective_user.id if update.effective_user else None,
+        username=update.effective_user.username if update.effective_user else None,
+        action="claude_voice_continue",
+        args=preview,
+        extra={"session_id": sess.id, "duration_sec": voice.duration},
+    )
+
+    await _run_continuation(
+        update, context, transcript,
+        audit_action="claude_voice_continue_dispatch",
+        intro_emoji="🎙",
+        intro_label=f"Voice → kontynuacja: „{preview}\"",
+    )
+    return True
+
+
+async def maybe_continue_via_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handler for plain text messages (no command prefix). Silently ignored unless
+    chat has active/paused /claude session.
+    """
+    if not _is_authorized(update):
+        return
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    sess = agent_session.load_active(chat_id)
+    if sess is None:
+        return  # no session — do nothing (user just chatting at bot)
+
+    if sess.status == "awaiting_approval":
+        await msg.reply_text(
+            "📌 Sesja `/claude` czeka na decyzję. Użyj `/yes`, `/no [powód]` albo "
+            "`/edit <nowa instrukcja>`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if sess.status not in ("active", "paused"):
+        return
+
+    await _run_continuation(
+        update, context, msg.text.strip(),
+        audit_action="claude_text_continue",
+        intro_emoji="💬",
+        intro_label="(kontynuacja sesji)",
+    )

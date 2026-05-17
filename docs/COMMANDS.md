@@ -50,6 +50,17 @@ Odpowiedzi na zapytania agenta (gdy bot napisze "⏳ Wymagana zgoda"):
 - `/no [powód]` — agent dostaje synthetic error i kontynuuje innym podejściem
 - `/edit <new>` — agent anuluje pending tool i dostaje nową dyrektywę jako kolejną user message
 
+### Continuation bez `/claude` (tekst + voice)
+
+Gdy istnieje aktywna sesja (status=active|paused), wiadomości BEZ prefiksu `/claude` są traktowane jako kontynuacja:
+
+- **Plain text:** `wypisz mi tabelę kosztów` → bot wyświetla `💬 (kontynuacja sesji)` i podaje tekst agentowi.
+- **Voice message:** transkrypcja przez Whisper (lokalny `whisper-cli`, ten sam stack co istniejący `/voice → HOS`), bot wyświetla `🎙 Transkrypcja: "..."` i podaje transkrypt agentowi.
+
+Gdy sesja jest `awaiting_approval`, plain text i voice **nie kontynuują** — bot przypomina o `/yes /no /edit`. Gdy brak sesji, text bez komendy jest ignorowany (zachowane zachowanie sprzed sprintu — bot nie odpowiada na "cześć"), voice idzie domyślną ścieżką Whisper → HOS dla Worker classification.
+
+Voice transkrypcja używa istniejącej infrastruktury (`whisper.cpp` w kontenerze, model `ggml-base.bin` lub przesłonięty przez `WHISPER_MODEL_PATH`). Brak dodatkowych zależności.
+
 ### Approval gates (kiedy bot pyta o /yes)
 
 Tier 2 (wymaga `/yes`):

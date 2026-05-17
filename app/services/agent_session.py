@@ -27,7 +27,7 @@ Session shape (json):
       "requested_at": <iso>
     } | null,
     "last_progress_message_id": 789,       # Telegram message id used for streaming
-    "model": "claude-sonnet-4-...",
+    "model": "claude-sonnet-4-6-...",
     "created_at": <iso>,
     "updated_at": <iso>
   }
