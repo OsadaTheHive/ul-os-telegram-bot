@@ -72,6 +72,9 @@ class Settings(BaseSettings):
     anthropic_agent_max_tokens: int = Field(default=16000)
     anthropic_agent_max_iterations: int = Field(default=24)
     anthropic_agent_summary_threshold: int = Field(default=180000)  # tokens, then auto-summarize
+    # /claude rate limit — max new sessions per window per user (continuations don't count)
+    claude_rate_limit: int = Field(default=100)
+    claude_rate_window_s: float = Field(default=3600.0)
     # OpenAI Whisper (voice transcription)
     openai_api_key: str = Field(default="")
     openai_whisper_model: str = Field(default="whisper-1")

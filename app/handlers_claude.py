@@ -29,9 +29,10 @@ from .services import agent, agent_session
 
 log = logging.getLogger(__name__)
 
-# Rate limit: 5 starts per hour per user (continuations/approvals don't count)
-CLAUDE_RATE_LIMIT = 5
-CLAUDE_RATE_WINDOW_S = 3600.0
+# Rate limit: N starts per window per user (continuations/approvals don't count)
+# Configurable via CLAUDE_RATE_LIMIT and CLAUDE_RATE_WINDOW_S env vars.
+CLAUDE_RATE_LIMIT = settings.claude_rate_limit
+CLAUDE_RATE_WINDOW_S = settings.claude_rate_window_s
 
 _limiter = lim.RateLimiter()
 
