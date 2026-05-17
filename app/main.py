@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
+from datetime import time as dt_time
 
 from telegram import BotCommand, Update
 from telegram.ext import (
@@ -29,11 +29,8 @@ from telegram.ext import (
     filters,
 )
 
-from datetime import time as dt_time
-
-from . import audit, breaker, health_endpoint, monitor
+from . import audit, health_endpoint, monitor, observability
 from .config import settings
-from .limiter import check as rate_check
 from .handlers import (
     handle_alerts,
     handle_ask,
@@ -43,27 +40,39 @@ from .handlers import (
     handle_dlq,
     handle_document,
     handle_generate,
-    handle_help,
     handle_health,
+    handle_help,
     handle_koszty,
     handle_limits,
     handle_mcp_status,
     handle_mcp_szukaj,
     handle_mcp_tools,
     handle_ostatnie,
-    handle_research,
-    handle_status,
-    handle_upload_stats,
     handle_photo,
     handle_produkt,
+    handle_research,
     handle_start,
+    handle_status,
     handle_szukaj,
     handle_ulos_status,
     handle_unauthorized,
+    handle_upload_stats,
     handle_voice,
 )
-
-from . import observability
+from .handlers_claude import (
+    handle_claude,
+    handle_claude_cost,
+    handle_claude_history,
+    handle_claude_new,
+    handle_claude_pause,
+    handle_claude_resume,
+    handle_claude_status,
+    handle_edit,
+    handle_no,
+    handle_yes,
+    notify_restart_resume,
+)
+from .limiter import check as rate_check
 
 # Setup logging (text format dla dev / JSON dla produkcji - LOG_FORMAT=json env)
 observability.setup_logging(level=logging.INFO)
@@ -283,6 +292,47 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_ask(update, context)
 
 
+# ─── /claude agent mode ────────────────────────────────────────────────────────
+async def cmd_claude(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await handle_claude(update, context)
+
+
+async def cmd_claude_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await handle_claude_new(update, context)
+
+
+async def cmd_claude_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await handle_claude_status(update, context)
+
+
+async def cmd_claude_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await handle_claude_history(update, context)
+
+
+async def cmd_claude_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await handle_claude_pause(update, context)
+
+
+async def cmd_claude_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await handle_claude_resume(update, context)
+
+
+async def cmd_claude_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await handle_claude_cost(update, context)
+
+
+async def cmd_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await handle_yes(update, context)
+
+
+async def cmd_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await handle_no(update, context)
+
+
+async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await handle_edit(update, context)
+
+
 async def cmd_upload_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorized_or_ignore(update, context):
         return
@@ -333,6 +383,16 @@ async def post_init(app: Application):
             BotCommand("research", "/research <prompt> → Perplexity Deep Research → Vault"),
             BotCommand("ask", "/ask <pytanie> → Claude z dostępem do Vault (multi-turn)"),
             BotCommand("upload_stats", "Statystyki upload per user (dziś/7d/30d)"),
+            BotCommand("claude", "/claude <zadanie> → Agent z pełnym MCP (commit/deploy)"),
+            BotCommand("claude_new", "/claude_new <prompt> → wymuś nową sesję"),
+            BotCommand("claude_status", "Status aktywnej sesji /claude"),
+            BotCommand("claude_history", "Ostatnie 10 sesji /claude"),
+            BotCommand("claude_pause", "Zapauzuj aktywną sesję"),
+            BotCommand("claude_resume", "Wznów zapauzowaną sesję"),
+            BotCommand("claude_cost", "Kumulatywny koszt /claude"),
+            BotCommand("yes", "Zaakceptuj oczekującą akcję agenta"),
+            BotCommand("no", "/no [powód] → odrzuć akcję agenta"),
+            BotCommand("edit", "/edit <nowa instrukcja> → anuluj akcję, zlec inne"),
         ]
     )
     log.info(
@@ -350,6 +410,12 @@ async def post_init(app: Application):
         result="ok",
         extra={"whitelist_size": len(settings.admin_user_ids)},
     )
+
+    # Notify chats with active /claude sessions that bot restarted
+    try:
+        await notify_restart_resume(app)
+    except Exception as e:  # noqa: BLE001
+        log.warning("notify_restart_resume failed: %s", e)
 
     # Background health monitor: pierwsza po 60s (warm up), potem co 5 min
     if app.job_queue is not None:
@@ -416,6 +482,18 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("ask", cmd_ask))
     app.add_handler(CommandHandler("upload_stats", cmd_upload_stats))
     app.add_handler(CommandHandler("uploadstats", cmd_upload_stats))  # alias
+
+    # /claude agent mode (Sprint: VPS-native agent)
+    app.add_handler(CommandHandler("claude", cmd_claude))
+    app.add_handler(CommandHandler("claude_new", cmd_claude_new))
+    app.add_handler(CommandHandler("claude_status", cmd_claude_status))
+    app.add_handler(CommandHandler("claude_history", cmd_claude_history))
+    app.add_handler(CommandHandler("claude_pause", cmd_claude_pause))
+    app.add_handler(CommandHandler("claude_resume", cmd_claude_resume))
+    app.add_handler(CommandHandler("claude_cost", cmd_claude_cost))
+    app.add_handler(CommandHandler("yes", cmd_yes))
+    app.add_handler(CommandHandler("no", cmd_no))
+    app.add_handler(CommandHandler("edit", cmd_edit))
 
     app.add_handler(MessageHandler(filters.Document.ALL, msg_document))
     app.add_handler(MessageHandler(filters.PHOTO, msg_photo))
