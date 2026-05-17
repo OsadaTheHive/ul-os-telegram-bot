@@ -66,6 +66,12 @@ class Settings(BaseSettings):
     # Anthropic (Conversational /ask z dostepem do MCP tools)
     anthropic_api_key: str = Field(default="")
     anthropic_model: str = Field(default="claude-haiku-4-5")
+    # Agent mode (/claude) — wezszy stack, pelne MCP tools, approval gates, streaming
+    anthropic_agent_model: str = Field(default="claude-sonnet-4-6-20250929")
+    anthropic_agent_thinking_budget: int = Field(default=8000)
+    anthropic_agent_max_tokens: int = Field(default=16000)
+    anthropic_agent_max_iterations: int = Field(default=24)
+    anthropic_agent_summary_threshold: int = Field(default=180000)  # tokens, then auto-summarize
     # OpenAI Whisper (voice transcription)
     openai_api_key: str = Field(default="")
     openai_whisper_model: str = Field(default="whisper-1")

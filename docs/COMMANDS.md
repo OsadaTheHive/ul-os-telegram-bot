@@ -1,6 +1,91 @@
 # Bot Commands Reference
 
-Pełna dokumentacja 16 komend bota.
+Pełna dokumentacja komend bota (23 podstawowe + 10 /claude family).
+
+## /claude agent mode
+
+Pełen agent Claude (Sonnet 4 + extended thinking) z dostępem do wszystkich MCP UL OS tooli — wykonuje zadania end-to-end (analiza, commit, deploy) z poziomu Telegrama.
+
+### `/claude <prompt>`
+Start lub kontynuacja sesji agenta. Jedna aktywna sesja per chat.
+
+```
+/claude zaktualizuj hero na /prototypy żeby był bardziej kontrastowy
+/claude sprawdź ostatni commit w THE-HIVE i wypisz 3 największe luki w /prototypy
+```
+
+Bot tworzy nową sesję (lub kontynuuje istniejącą). Edytuje JEDNĄ wiadomość pokazując progres tool-by-tool:
+```
+🔍 vault_search prototypy hero
+🐙 github_repo_get OsadaTheHive/THE-HIVE
+📦 e2b_sandbox_create base
+📝 e2b_write_file /repo/src/.../page.tsx
+🐙 github_commit_files feature/hero-contrast
+⏳ Wymagana zgoda: github_pr_merge PR #5
+```
+
+Limit: 5 nowych sesji /h per user (kontynuacje sesji nie liczą się). Storage: S3 (`s3://${S3_BUCKET}/${S3_INBOX_PREFIX}claude-sessions/${chat_id}/`).
+
+### `/claude_new <prompt>`
+Wymusza start nowej sesji nawet jeśli istnieje aktywna. Aktywna przechodzi w `completed` (możliwa via /claude_history).
+
+### `/claude_status`
+Pokazuje aktywną sesję: id, tytuł, status, tury historii, tokeny, koszt, ostatni tool, storage backend, pending approval (jeśli jest).
+
+### `/claude_history`
+Lista 10 ostatnich sesji z statusami, tokenami, kosztem.
+
+### `/claude_pause`
+Pauzuje aktywną sesję — kolejna `/claude <prompt>` nie zostanie potraktowana jako kontynuacja. `/claude_resume` aby wrócić.
+
+### `/claude_resume`
+Wznawia zapauzowaną sesję. Jeśli status to `awaiting_approval`, informuje o pendingowej decyzji.
+
+### `/claude_cost`
+Kumulatywny koszt /claude — total ze wszystkich sesji per chat (z S3).
+
+### `/yes` / `/no [powód]` / `/edit <instrukcja>`
+Odpowiedzi na zapytania agenta (gdy bot napisze "⏳ Wymagana zgoda"):
+- `/yes` — agent wykonuje pendingowy tool_use
+- `/no [powód]` — agent dostaje synthetic error i kontynuuje innym podejściem
+- `/edit <new>` — agent anuluje pending tool i dostaje nową dyrektywę jako kolejną user message
+
+### Continuation bez `/claude` (tekst + voice)
+
+Gdy istnieje aktywna sesja (status=active|paused), wiadomości BEZ prefiksu `/claude` są traktowane jako kontynuacja:
+
+- **Plain text:** `wypisz mi tabelę kosztów` → bot wyświetla `💬 (kontynuacja sesji)` i podaje tekst agentowi.
+- **Voice message:** transkrypcja przez Whisper (lokalny `whisper-cli`, ten sam stack co istniejący `/voice → HOS`), bot wyświetla `🎙 Transkrypcja: "..."` i podaje transkrypt agentowi.
+
+Gdy sesja jest `awaiting_approval`, plain text i voice **nie kontynuują** — bot przypomina o `/yes /no /edit`. Gdy brak sesji, text bez komendy jest ignorowany (zachowane zachowanie sprzed sprintu — bot nie odpowiada na "cześć"), voice idzie domyślną ścieżką Whisper → HOS dla Worker classification.
+
+Voice transkrypcja używa istniejącej infrastruktury (`whisper.cpp` w kontenerze, model `ggml-base.bin` lub przesłonięty przez `WHISPER_MODEL_PATH`). Brak dodatkowych zależności.
+
+### Approval gates (kiedy bot pyta o /yes)
+
+Tier 2 (wymaga `/yes`):
+- `github_pr_merge`, `github_create_pr`
+- `github_commit_files` z `branch=main` (bezpośredni commit do produkcji)
+- `coolify_app_deploy`, `coolify_app_restart`, `coolify_env_set`
+- `directus_create_field`, `directus_extend_enum`, `directus_delete_record`
+- `vault_write` poza `00 — META/STATE/`
+- `gmail_send` (NIE draft)
+- `drive_file_upload` z `share=public|domain|anyone`
+
+Tier 1 (HARD BLOCK, /yes niepomoże):
+- `directus_*` na cousin's collections: Monet_*, Modbus_*, Beezhub_*, Agregator_*, Devices, Sites, Tariffs
+- `vault_write` na `00 — META/CONSTITUTION/` lub `00 — META/POLICIES/`
+
+### Edge cases
+
+- Sesja > 180k tokenów → auto-summarize first half via Haiku, kontynuacja na nowej krótszej historii
+- Bot restart → przy starcie skanuje S3, wysyła "🔄 Bot zrestartowany, sesja wznowiona" do każdego chat z aktywną sesją
+- `/claude` na sesji w `awaiting_approval` → bot przypomina pending action i prosi o /yes /no /edit
+- 24 iteracje agent-loop max per turn (chroni przed infinite loops)
+
+---
+
+Pełna dokumentacja 23 komend podstawowych bota poniżej.
 
 ## Podstawowe
 
