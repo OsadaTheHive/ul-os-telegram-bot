@@ -78,6 +78,7 @@ from .handlers_voice import (
     handle_voice_status,
 )
 from .limiter import check as rate_check
+from .handlers_komplet import cmd_komplet
 
 # Setup logging (text format dla dev / JSON dla produkcji - LOG_FORMAT=json env)
 observability.setup_logging(level=logging.INFO)
@@ -521,6 +522,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("ask", cmd_ask))
     app.add_handler(CommandHandler("upload_stats", cmd_upload_stats))
     app.add_handler(CommandHandler("uploadstats", cmd_upload_stats))  # alias
+    app.add_handler(CommandHandler("komplet", cmd_komplet))
 
     # /claude agent mode (Sprint: VPS-native agent)
     app.add_handler(CommandHandler("claude", cmd_claude))
