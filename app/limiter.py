@@ -13,6 +13,7 @@ uzyc Redis (`redis.incr` z TTL).
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import defaultdict, deque
 from threading import Lock
@@ -92,20 +93,44 @@ LIMITS = {
     # MCP queries: 5/min (chroni przed wyczerpaniem MCP rate limits)
     "mcp_status": (10, 60),
     "mcp_szukaj": (5, 60),
-    # File ingest: 3/min (chroni przed costly Anthropic calls)
-    "document": (3, 60),
-    "photo": (3, 60),
-    "voice": (3, 60),
-    # Globalny limit: 60/min na usera (sumarycznie)
-    "_global": (60, 60),
+    # File ingest: 20/min dla zwyklych userow (admini bez limitu - patrz check()).
+    # Podniesione z 3, bo wielostronicowe protokoly/komplety byly ucinane.
+    "document": (20, 60),
+    "photo": (20, 60),
+    "voice": (20, 60),
+    # Globalny limit: 120/min na usera (sumarycznie)
+    "_global": (120, 60),
 }
+
+
+def _load_admin_ids() -> set[int]:
+    """Telegram user_id administratorow z env ADMIN_CHAT_IDS (CSV). Bez limitu."""
+    raw = os.environ.get("ADMIN_CHAT_IDS", "")
+    out: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            pass
+    return out
+
+
+ADMIN_IDS = _load_admin_ids()
 
 
 def check(user_id: int, key: str) -> tuple[bool, str | None]:
     """Helper - zwraca (allowed, error_message_pl).
 
-    Sprawdza najpierw _global, potem per-key.
+    Administratorzy (ADMIN_CHAT_IDS) sa zwolnieni z limitow - moga wrzucac cale
+    wielostronicowe protokoly/komplety bez gubienia stron.
+    Dla pozostalych: sprawdza najpierw _global, potem per-key.
     """
+    if user_id in ADMIN_IDS:
+        return True, None
+
     g_limit, g_window = LIMITS["_global"]
     if not limiter.allow(user_id, "_global", limit=g_limit, window=g_window):
         return False, f"Za duzo zapytań (>{g_limit}/min). Sprobuj za chwile."
