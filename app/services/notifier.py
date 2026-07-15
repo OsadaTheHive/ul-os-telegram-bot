@@ -7,12 +7,20 @@ Sprint 1.11 (ADR Hubert): cron co 4h sprawdza:
   3) Directus knowledge_items: items z status='pending_review' starsze niż ALERT_REVIEW_DAYS (7 dni)
   4) Grant deadlines: Vault search w 00 — META / 01 — DZIENNIK / 50 — BIDBEE
      po dokumentach z frontmatter `deadline_date` ≤ 7 dni
+  5) Health checks (health_checks w ulos_knowledge, przez MCP directus_query): jakikolwiek
+     check_name ze statusem 'fail' w ostatnich 20 minutach — dodane 2026-07-15 (Hubert:
+     "chce wiedziec realnie co sie zesralo, a nie dowiadywac sie po dniu"). To jest most,
+     ktorego brakowalo: worker (ul-os-worker/ul-os-mcp) juz pisze do health_checks/
+     worker_alerts, ale nic wczesniej stad nie forwardowalo na Telegram.
 
 Antiflapping: per-check cooldown (state w `logs/notifier_state.json`):
   - DLQ: alert TYLKO gdy count wzrósł od ostatniego ticka
   - Queue: alert raz na N min jeśli >threshold (default 30 min cooldown)
   - Review: alert raz dziennie (24h cooldown)
   - Deadlines: alert raz dziennie per deadline_id
+  - Health: alert raz na COOLDOWN_HEALTH (default 20 min) PER check_name — nie per tick,
+    żeby nie spamować tym samym FAIL co 4h jesli sie nie zmienil, ale tez nie co tick jesli
+    tick byloby czestsze.
 
 JobQueue (python-telegram-bot) wywołuje `notifier.tick(context)` co 4h.
 Notyfikacja wysyłana do każdego user_id w ADMIN_CHAT_IDS.
@@ -35,6 +43,7 @@ from botocore.exceptions import ClientError
 from telegram.ext import ContextTypes
 
 from app.config import settings
+from app.services.mcp_client import get_client as get_mcp_client, extract_text_content, MCPError
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +57,9 @@ STATE_FILE = Path(__file__).parent.parent.parent / "logs" / "notifier_state.json
 COOLDOWN_QUEUE = 30 * 60       # 30 min
 COOLDOWN_REVIEW = 24 * 3600    # 24h
 COOLDOWN_DEADLINE_PER = 24 * 3600  # 24h per deadline_id
+COOLDOWN_HEALTH_PER = 20 * 60  # 20 min per check_name
+# Ile minut wstecz uznajemy pomiar health_checks za "świeży" (zbieżne z regułą service_check).
+HEALTH_FRESHNESS_MIN = 20
 
 
 @dataclass
@@ -58,6 +70,7 @@ class NotifierState:
     last_queue_alert_ts: float = 0.0
     last_review_alert_ts: float = 0.0
     deadline_alerted: dict[str, float] = field(default_factory=dict)
+    health_alerted: dict[str, float] = field(default_factory=dict)
 
     @classmethod
     def load(cls) -> "NotifierState":
@@ -126,7 +139,7 @@ async def check_dlq(state: NotifierState) -> str | None:
     if count > state.last_dlq_count:
         diff = count - state.last_dlq_count
         msg = (
-            f"🪦 DLQ wzrosł: +{diff} nowych failed.\n"
+            f"🪦 DLQ wzrósł: +{diff} nowych failed.\n"
             f"Total: {count} items w inbox-failed/\n"
             f"Sprawdź: /dlq {min(diff + 5, 20)}"
         )
@@ -269,6 +282,87 @@ async def check_grant_deadlines(state: NotifierState) -> list[str]:
     return alerts
 
 
+async def check_health_failures(state: NotifierState) -> list[str]:
+    """
+    NOWE 2026-07-15 (Hubert: chce realnego alertu na Telegram gdy cos sie zesra na Sparku/
+    workerze, zamiast dowiadywac sie po 1-2 dniach).
+
+    Odpytuje kolekcje health_checks w ulos_knowledge (przez MCP directus_query — ten sam
+    serwer co reszta bota, zero nowych credentiali) po najnowszym wierszu KAżDEGO check_name
+    i alertuje na status='fail'. Ignoruje 'warn' celowo — warny sa czeste (np. drive rozjazdy)
+    i zalatwiane osobno; fail = realna awaria wymagajaca uwagi.
+
+    Świeżość: pomija pomiary starsze niż HEALTH_FRESHNESS_MIN — martwy runner (overall=stale
+    w service_check) nie powinien generowac starych alertow w kolko.
+
+    Cooldown PER check_name (nie per tick) — ten sam check_name w stanie fail nie alertuje
+    ponownie przez COOLDOWN_HEALTH_PER, ale RESETUJE cooldown gdy wraca do ok (żeby kolejny
+    fail po naprawie od razu alertowal, nie czekal na wygasniecie starego cooldownu).
+    """
+    client = get_mcp_client()
+    if client is None:
+        return []
+
+    try:
+        result = await client.call_tool(
+            "directus_query",
+            {
+                "collection": "health_checks",
+                "query": {
+                    "fields": ["check_name", "status", "value", "detail", "ts"],
+                    "sort": ["-ts"],
+                    "limit": 200,
+                },
+            },
+        )
+        text = extract_text_content(result)
+        rows = json.loads(text) if text else []
+        if isinstance(rows, dict):
+            rows = rows.get("data", [])
+    except (MCPError, json.JSONDecodeError, Exception) as e:
+        log.warning("check_health_failures MCP error: %s", e)
+        return []
+
+    # Najnowszy wiersz per check_name (rows juz posortowane -ts, wiec pierwszy trafiony wygrywa).
+    latest: dict[str, dict] = {}
+    for row in rows:
+        name = row.get("check_name")
+        if name and name not in latest:
+            latest[name] = row
+
+    now = datetime.now(timezone.utc).timestamp()
+    cutoff = now - HEALTH_FRESHNESS_MIN * 60
+    alerts: list[str] = []
+
+    for name, row in latest.items():
+        status = row.get("status")
+        ts_raw = row.get("ts")
+        try:
+            ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue  # pomiar zbyt stary — martwy runner, nie realny fail teraz
+
+        if status != "fail":
+            # Wraca do zdrowia — resetuj cooldown, zeby kolejny fail alertowal od razu.
+            state.health_alerted.pop(name, None)
+            continue
+
+        last = state.health_alerted.get(name, 0.0)
+        if now - last < COOLDOWN_HEALTH_PER:
+            continue
+
+        alerts.append(
+            f"🔥 Health FAIL: {name}\n"
+            f"  {row.get('detail', '?')[:200]}\n"
+            f"  wartosc: {row.get('value', '?')}"
+        )
+        state.health_alerted[name] = now
+
+    return alerts
+
+
 # === Bot job ===
 
 async def tick(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -286,6 +380,7 @@ async def tick(context: ContextTypes.DEFAULT_TYPE) -> None:
         check_inbox_queue(state),
         check_needs_review(state),
         check_grant_deadlines(state),
+        check_health_failures(state),
         return_exceptions=True,
     )
 
@@ -333,6 +428,9 @@ async def manual_run() -> dict[str, Any]:
 
     deadlines = await check_grant_deadlines(state)
     results["deadlines"] = deadlines or ["OK"]
+
+    health = await check_health_failures(state)
+    results["health"] = health or ["OK"]
 
     state.save()
     return results
