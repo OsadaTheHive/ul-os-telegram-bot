@@ -1,5 +1,5 @@
 """
-Background monitoring job - sprawdza health Directus + MCP + Vault co X minut.
+Background monitoring job - sprawdza health Directus + MCP + pipeline UL OS co X minut.
 
 Jezeli cos pad - alert do wszystkich w ADMIN_CHAT_IDS przez bota.
 
@@ -10,6 +10,17 @@ Failure threshold (anty-flapping):
     - Pierwsza failed check NIE alertuje (pewnie chwilowy timeout)
     - Druga failed check (= 10 min downtime) → alert
     - Po recovery → "✓ przywrocone"
+
+PIPELINE UL OS (2026-07-20): trzeci zmysl monitora — tabela health_checks
+(kolejki OCR/klasyfikator/transkrypcja, dead-letter, poczta, drive, paid_apis...)
+czytana przez endpoint workera GET /ingest/health-checks (token INGEST).
+Bez tego bot widzial tylko pad Directusa/MCP, a caly pipeline mogl lezec
+tygodniami po cichu (przypadek: martwy tunel ingest 2026-07-16, zawieszony
+watcher 2026-07-19 — oba wykryte dopiero na pytanie Huberta).
+Status 'warn' NIE alertuje (szum); alertuje wylacznie 'fail', z dluzszym
+cooldownem (PIPELINE_ALERT_COOLDOWN, domyslnie 6h) — trwale faile w rodzaju
+swiezo zasilonego dead-lettera nie spamuja co 30 minut.
+Self-gated: brak PIPELINE_HEALTH_URL/TOKEN w env → zero zmiany zachowania.
 
 State per komponent w in-memory dict (resetuje sie przy restart bota).
 """
@@ -38,6 +49,10 @@ ALERT_AFTER_FAILURES = 2
 # Cooldown między alertami tej samej awarii (sekundy)
 ALERT_COOLDOWN = 1800  # 30 min
 
+# Dluzszy cooldown dla checkow pipeline (trwale faile, np. dead_letter po odsiewie
+# uszkodzonych plikow, nie powinny spamowac co 30 min).
+PIPELINE_ALERT_COOLDOWN = 6 * 3600  # 6h
+
 
 def _bump_failure(component: str) -> int:
     """Inkrementuj licznik failures, zwroc nowa wartosc."""
@@ -54,10 +69,10 @@ def _reset_failure(component: str) -> int:
     return prev
 
 
-def _can_alert(component: str) -> bool:
+def _can_alert(component: str, cooldown: int = ALERT_COOLDOWN) -> bool:
     """Czy mozemy juz alertowac (nie spam)."""
     s = _state.setdefault(component, {"failures": 0, "last_alert_ts": 0})
-    return time.time() - s["last_alert_ts"] >= ALERT_COOLDOWN
+    return time.time() - s["last_alert_ts"] >= cooldown
 
 
 def _mark_alerted(component: str):
@@ -93,6 +108,35 @@ async def _check_mcp(client: httpx.AsyncClient) -> tuple[bool, str]:
         return False, f"MCP exception: {e.__class__.__name__}"
 
 
+async def _check_pipeline(client: httpx.AsyncClient) -> list[tuple[str, bool, str]]:
+    """Stan checkow pipeline UL OS z tabeli health_checks (przez endpoint workera).
+
+    Zwraca liste (component, ok, msg). Pusta lista = feature nieskonfigurowany.
+    'warn' traktujemy jako ok (nie alertujemy szumem) — alert tylko na 'fail'.
+    """
+    if not settings.pipeline_health_url or not settings.pipeline_health_token:
+        return []
+    try:
+        r = await client.get(
+            settings.pipeline_health_url,
+            headers={"Authorization": f"Bearer {settings.pipeline_health_token}"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return [("pipeline:endpoint", False, f"health-checks HTTP {r.status_code}")]
+        data = r.json()
+        out: list[tuple[str, bool, str]] = []
+        for c in data.get("checks", []):
+            name = str(c.get("check_name") or "?")
+            status = str(c.get("status") or "").lower()
+            detail = str(c.get("detail") or "")[:180]
+            ok = status != "fail"
+            out.append((f"pipeline:{name}", ok, f"[{status}] {detail}"))
+        return out
+    except Exception as e:
+        return [("pipeline:endpoint", False, f"exception: {e.__class__.__name__}")]
+
+
 async def tick(context: ContextTypes.DEFAULT_TYPE):
     """Job entry point - wywołane co 5 min przez JobQueue."""
     log.info("Monitor tick: checking health...")
@@ -102,9 +146,14 @@ async def tick(context: ContextTypes.DEFAULT_TYPE):
             "directus": await _check_directus(client),
             "mcp": await _check_mcp(client),
         }
+        pipeline = await _check_pipeline(client)
+
+    results: list[tuple[str, bool, str]] = [(k, ok, msg) for k, (ok, msg) in checks.items()]
+    results.extend(pipeline)
 
     # Per komponent: jezeli pad i przekroczył threshold → alert
-    for component, (ok, msg) in checks.items():
+    for component, ok, msg in results:
+        cooldown = PIPELINE_ALERT_COOLDOWN if component.startswith("pipeline:") else ALERT_COOLDOWN
         if ok:
             prev_failures = _reset_failure(component)
             if prev_failures >= ALERT_AFTER_FAILURES:
@@ -119,11 +168,11 @@ async def tick(context: ContextTypes.DEFAULT_TYPE):
         else:
             failures = _bump_failure(component)
             log.warning("Monitor: %s failed (#%d): %s", component, failures, msg)
-            if failures >= ALERT_AFTER_FAILURES and _can_alert(component):
+            if failures >= ALERT_AFTER_FAILURES and _can_alert(component, cooldown):
                 await _alert(
                     context,
                     f"🔴 {component.upper()} pad: {msg}\n"
-                    f"(po {failures} kolejnych failed check'ach, ~{(failures * 5)} min downtime)",
+                    f"(po {failures} kolejnych failed check'ach, ~{(failures * 5)} min)",
                 )
                 _mark_alerted(component)
                 audit.write(

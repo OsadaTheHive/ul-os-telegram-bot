@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     # Telegram
     telegram_bot_token: str = Field(...)
     # Raw CSV string z .env - parsowany przez admin_user_ids property.
-    # Bezpośrednio jako frozenset[int] nie da rady bo pydantic-settings probuje JSON.
+    # Bezposrednio jako frozenset[int] nie da rady bo pydantic-settings probuje JSON.
     admin_chat_ids: str = Field(default="")
 
     @property
@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     # MCP server (UL OS Knowledge bridge)
     mcp_base_url: str = Field(default="https://mcp.bidbee.pl")
     mcp_bearer_token: str = Field(default="")
+
+    # Pipeline health (2026-07-20) — monitor.py czyta stan checkow UL OS
+    # z endpointu workera GET /ingest/health-checks (za tokenem INGEST).
+    # Puste = feature wylaczony (self-gated), monitor dziala jak dotad.
+    pipeline_health_url: str = Field(default="")
+    pipeline_health_token: str = Field(default="")
 
     # Storage — Hetzner Object Storage (per ADR-001 z 2026-05-09, supersedes B2 plan)
     s3_endpoint: str = Field(default="")  # np. https://nbg1.your-objectstorage.com
