@@ -51,6 +51,13 @@ class Settings(BaseSettings):
     pipeline_health_url: str = Field(default="")
     pipeline_health_token: str = Field(default="")
 
+    # Ingest API workera (Telegram-wrzutnia — Faza 2 toru SYNC, MASTERPLAN v2.3).
+    # Domyslnie wyprowadzane z pipeline_health_* (ten sam INGEST_TOKEN; baza =
+    # PIPELINE_HEALTH_URL bez koncowki /health-checks) — zero nowych sekretow
+    # na produkcji. Nadpisywalne, gdyby endpointy sie kiedys rozjechaly.
+    ingest_url: str = Field(default="")
+    ingest_token: str = Field(default="")
+
     # Storage — Hetzner Object Storage (per ADR-001 z 2026-05-09, supersedes B2 plan)
     s3_endpoint: str = Field(default="")  # np. https://nbg1.your-objectstorage.com
     s3_bucket: str = Field(default="ul-os-storage")  # bucket startowy w Nuremberg
