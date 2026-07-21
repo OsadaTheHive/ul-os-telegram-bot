@@ -57,7 +57,6 @@ from .handlers import (
     handle_ulos_status,
     handle_unauthorized,
     handle_upload_stats,
-    handle_voice,
 )
 from .handlers_claude import (
     handle_claude,
@@ -76,6 +75,11 @@ from .handlers_voice import (
     handle_voice_off,
     handle_voice_on,
     handle_voice_status,
+)
+from .handlers_wrzutnia import (
+    handle_audio_ingest,
+    handle_forwarded_text_ingest,
+    handle_voice_ingest,
 )
 from .limiter import check as rate_check
 from .handlers_komplet import cmd_komplet
@@ -107,6 +111,8 @@ def _action_key(update: Update) -> str:
             return "photo"
         if update.message.voice:
             return "voice"
+        if update.message.audio or update.message.video_note:
+            return "audio"
     return "unknown"
 
 
@@ -298,7 +304,7 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_ask(update, context)
 
 
-# ─── /claude agent mode ────────────────────────────────────────────────────────
+# ─── /claude agent mode ──────────────────────────────────────────────────
 async def cmd_claude(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_claude(update, context)
 
@@ -379,19 +385,34 @@ async def msg_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorized_or_ignore(update, context):
         return
     # If chat has an active /claude session, intercept voice → transcribe → continue.
-    # Returns True when handled — otherwise fall through to default Whisper → HOS upload.
+    # Returns True when handled — otherwise fall through to Telegram-wrzutnia
+    # (POST /ingest/audio na workerze: whisper VPS + S3 original + knowledge_items).
     from .handlers_claude import maybe_continue_via_voice
     if await maybe_continue_via_voice(update, context):
         return
-    await handle_voice(update, context)
+    await handle_voice_ingest(update, context)
+
+
+async def msg_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Plik audio (np. .m4a z Dyktafonu) lub video-note → Telegram-wrzutnia (ingest)."""
+    if not await authorized_or_ignore(update, context):
+        return
+    await handle_audio_ingest(update, context)
 
 
 async def msg_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Plain text (no command). Continues active /claude session if any; ignored otherwise."""
+    """Plain text (no command).
+
+    1) Kontynuacja aktywnej sesji /claude (jak dotąd).
+    2) FORWARD tekstu bez aktywnej sesji → Telegram-wrzutnia (ingest do bazy).
+       handle_forwarded_text_ingest sam się gate'uje (tylko forwardy, tylko bez sesji),
+       więc zwykłe pisanie do bota zachowuje się identycznie jak wcześniej.
+    """
     if not await authorized_or_ignore(update, context):
         return
     from .handlers_claude import maybe_continue_via_text
     await maybe_continue_via_text(update, context)
+    await handle_forwarded_text_ingest(update, context)
 
 
 async def post_init(app: Application):
@@ -429,7 +450,7 @@ async def post_init(app: Application):
             BotCommand("claude_cost", "Kumulatywny koszt /claude"),
             BotCommand("yes", "Zaakceptuj oczekującą akcję agenta"),
             BotCommand("no", "/no [powód] → odrzuć akcję agenta"),
-            BotCommand("edit", "/edit <nowa instrukcja> → anuluj akcję, zlec inne"),
+            BotCommand("edit", "/edit <nowa instrukcja> → anuluj akcję, zleć inne"),
             BotCommand("voice_on", "🔊 Włącz TTS (ElevenLabs) dla odpowiedzi /claude"),
             BotCommand("voice_off", "🔇 Wyłącz TTS"),
             BotCommand("voice_status", "Stan voice mode + dostępność klucza"),
@@ -544,7 +565,10 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Document.ALL, msg_document))
     app.add_handler(MessageHandler(filters.PHOTO, msg_photo))
     app.add_handler(MessageHandler(filters.VOICE, msg_voice))
-    # Plain text without command — continues active /claude session when present.
+    # Telegram-wrzutnia (Faza 2 SYNC): pliki audio + video-notes → ingest workera.
+    app.add_handler(MessageHandler(filters.AUDIO | filters.VIDEO_NOTE, msg_audio))
+    # Plain text without command — continues active /claude session when present;
+    # FORWARDY tekstu bez sesji idą do wrzutni (ingest).
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_text))
 
     return app
