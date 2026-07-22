@@ -71,6 +71,7 @@ from .handlers_claude import (
     handle_yes,
     notify_restart_resume,
 )
+from .handlers_komplet import cmd_komplet
 from .handlers_voice import (
     handle_voice_off,
     handle_voice_on,
@@ -82,7 +83,6 @@ from .handlers_wrzutnia import (
     handle_voice_ingest,
 )
 from .limiter import check as rate_check
-from .handlers_komplet import cmd_komplet
 
 # Setup logging (text format dla dev / JSON dla produkcji - LOG_FORMAT=json env)
 observability.setup_logging(level=logging.INFO)
@@ -274,6 +274,7 @@ async def cmd_mcp_tools(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === Sprint 1.6 / 1.7 / 1.9 / 1.10 / 1.11 ===
 
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorized_or_ignore(update, context):
         return
@@ -388,6 +389,7 @@ async def msg_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Returns True when handled — otherwise fall through to Telegram-wrzutnia
     # (POST /ingest/audio na workerze: whisper VPS + S3 original + knowledge_items).
     from .handlers_claude import maybe_continue_via_voice
+
     if await maybe_continue_via_voice(update, context):
         return
     await handle_voice_ingest(update, context)
@@ -411,6 +413,7 @@ async def msg_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorized_or_ignore(update, context):
         return
     from .handlers_claude import maybe_continue_via_text
+
     await maybe_continue_via_text(update, context)
     await handle_forwarded_text_ingest(update, context)
 
@@ -485,6 +488,7 @@ async def post_init(app: Application):
 
         # Daily digest 09:00 UTC (~11:00 PL czas zimowy / 11:00 PL letni)
         from .handlers import handle_digest_auto
+
         app.job_queue.run_daily(
             handle_digest_auto,
             time=dt_time(hour=9, minute=0),
@@ -494,6 +498,7 @@ async def post_init(app: Application):
 
         # Sprint 1.11 — Proactive notifications co N sek (default 4h = 14400s)
         from .services import notifier as _notifier
+
         _notif_interval = settings.notifier_interval_seconds
         app.job_queue.run_repeating(
             _notifier.tick,
@@ -501,7 +506,9 @@ async def post_init(app: Application):
             first=120,  # 2 min po starcie żeby pierwszy scan się wykonał
             name="proactive_notifier",
         )
-        log.info(f"Proactive notifier scheduled (interval={_notif_interval}s = {_notif_interval/3600:.1f}h)")
+        log.info(
+            f"Proactive notifier scheduled (interval={_notif_interval}s = {_notif_interval / 3600:.1f}h)"
+        )
 
     # HTTP health endpoint na port 8080 (dla zewnetrznego uptime monitora)
     try:
@@ -511,12 +518,7 @@ async def post_init(app: Application):
 
 
 def build_app() -> Application:
-    app = (
-        Application.builder()
-        .token(settings.telegram_bot_token)
-        .post_init(post_init)
-        .build()
-    )
+    app = Application.builder().token(settings.telegram_bot_token).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -579,7 +581,7 @@ def main():
     if settings.use_webhook:
         log.info("Starting in WEBHOOK mode on %s", settings.webhook_url)
         app.run_webhook(
-            listen="0.0.0.0",
+            listen="0.0.0.0",  # noqa: S104 — kontener musi nasłuchiwać z zewnątrz (reverse proxy Coolify)
             port=settings.webhook_port,
             url_path=settings.webhook_path,
             webhook_url=settings.webhook_url,
