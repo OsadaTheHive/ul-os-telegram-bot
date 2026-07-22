@@ -65,7 +65,8 @@ async def _ingest_audio_flow(
     kind_label: str,
 ) -> None:
     """Wspólny przebieg: idempotencja → download z TG → /ingest/audio → odpowiedź."""
-    from .idempotency import cache as idem_cache, telegram_file_key
+    from .idempotency import cache as idem_cache
+    from .idempotency import telegram_file_key
 
     msg = update.message
     user = update.effective_user
@@ -118,11 +119,9 @@ async def _ingest_audio_flow(
         # Fallback przetrwania: surowe audio do HOS inbox/ — plik nie ginie.
         log.warning("wrzutnia: ingest_audio fail (%s): %s — fallback HOS raw", filename, res.error)
         try:
-            await status_msg.edit_text(
-                f"⚠️ Ingest padł: {res.error}\n⬆️ Fallback: surowy plik do HOS inbox/…"
-            )
+            await status_msg.edit_text(f"⚠️ Ingest padł: {res.error}\n⬆️ Fallback: surowy plik do HOS inbox/…")
         except Exception:  # noqa: BLE001
-            pass
+            log.debug("wrzutnia: edit_text status padł (nieblokujące, plik i tak leci do HOS)")
         from .services.hos_uploader import upload_telegram_file
 
         up = await upload_telegram_file(
@@ -134,8 +133,7 @@ async def _ingest_audio_flow(
         )
         if up.success:
             await status_msg.edit_text(
-                f"⚠️ Ingest padł ({res.error}),\n"
-                f"✅ ale surowy plik poszedł do HOS: {up.s3_key}"
+                f"⚠️ Ingest padł ({res.error}),\n✅ ale surowy plik poszedł do HOS: {up.s3_key}"
             )
         else:
             await status_msg.edit_text(
@@ -241,13 +239,11 @@ async def handle_forwarded_text_ingest(update: Update, context: ContextTypes.DEF
 
         if agent_session.load_active(chat_id) is not None:
             return
-    except Exception:  # noqa: BLE001 — brak storage sesji nie może blokować wrzutni
-        pass
+    except Exception:  # noqa: BLE001
+        log.debug("wrzutnia: sprawdzenie sesji /claude padło (nieblokujące, kontynuujemy jako forward)")
 
     if not ingest_client.configured():
-        await msg.reply_text(
-            "⚠️ Ingest nie skonfigurowany (PIPELINE_HEALTH_URL/TOKEN lub INGEST_URL/TOKEN)."
-        )
+        await msg.reply_text("⚠️ Ingest nie skonfigurowany (PIPELINE_HEALTH_URL/TOKEN lub INGEST_URL/TOKEN).")
         return
 
     origin_label = ""
